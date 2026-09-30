@@ -2,7 +2,7 @@
 
 [Project website](https://yazhuo-liu.github.io/DichromaticMap/) · [Use online](https://yazhuo-liu.github.io/DichromaticMap/use.html) · [English user guide](https://github.com/Yazhuo-Liu/DichromaticMap/blob/main/docs/en/README.md) · [中文使用手册](https://github.com/Yazhuo-Liu/DichromaticMap/blob/main/docs/zh/README.md)
 
-If you find DichromaticMap helpful, please cite:
+If you find DichromaticMap helpful, please cite: 
 
 > K.Q. Ding, Y.Z. Liu, Y. Zhang, L.H. Wang, X.D. Han, T. Zhu,
 > “Misfit-dislocation hierarchy governs sliding of asymmetric non-CSL grain
