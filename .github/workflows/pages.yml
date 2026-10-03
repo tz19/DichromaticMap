@@ -6,10 +6,13 @@ on:
     paths:
       - "site/**"
       - "src/dichromatic_map/**"
-      - "docs/images/gui-overview.png"
-      - "docs/images/dichromatic_pattern_example.png"
-      - "docs/images/dichromaticmap_logo*.svg"
+      - "docs/**"
+      - "README.md"
+      - "CONTRIBUTING.md"
+      - "LICENSE"
+      - "packaging/**"
       - "scripts/build_site.py"
+      - "scripts/build_docs.py"
       - "pyproject.toml"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
@@ -35,15 +38,19 @@ jobs:
         with:
           python-version: "3.12"
       - name: Build static site
-        run: python scripts/build_site.py
+        run: |
+          python -m pip install ".[site]"
+          python scripts/build_site.py
       - name: Check browser adapter
         run: |
           python -m pip install numpy
           python scripts/smoke_web.py
           node --check site/index.js
           node --check site/use.js
+          node --check site/tutorial.js
           node --input-type=module --check < site/use_worker.js
           node site/mobile_interactions.test.js
+          node site/tutorial.test.js
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v4
         with:

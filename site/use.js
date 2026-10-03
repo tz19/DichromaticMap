@@ -164,6 +164,8 @@ function renderRequest() {
       pattern = result;
       $("engine-overlay").classList.add("hidden");
       document.querySelector(".control-pane").classList.remove("loading");
+      $("tutorial-start").disabled = false;
+      $("tutorial-start").title = "Explore the controls with a guided tutorial";
       draw();
       updateSummary();
       setStatus("Ready · choose an interaction tool");
@@ -350,6 +352,11 @@ function draw() {
   resizeCanvas();
   const r = plotRect();
   drawGrid(ctx, r);
+  // Keep plot overlays, including the supercell, inside the plotted axes.
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(r.left, r.top, r.width, r.height);
+  ctx.clip();
   drawAtoms(ctx);
   if (state.showCell) {
     const cell = state.nearCell || pattern?.exact_cell;
@@ -370,6 +377,9 @@ function draw() {
     drawVector(ctx);
     state.atoms.forEach((v, i) => { const [x, y] = screen(v.position); ctx.fillStyle = "#83419a"; ctx.fillText(`P${i + 1}`, x + 6, y - 7); });
   }
+  ctx.restore();
+  ctx.strokeStyle = "#8498c0";
+  ctx.strokeRect(r.left + .5, r.top + .5, r.width, r.height);
   if (state.referenceAxes) drawReferenceAxes(ctx, r);
   updateReferenceAxesToggle();
   positionVectorAnnotation();

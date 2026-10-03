@@ -1,9 +1,12 @@
 """Build the static Pages site with the current numerical package sources."""
 
 from pathlib import Path
+import json
 import shutil
 import re
 from zipfile import ZipFile, ZIP_DEFLATED
+
+from build_docs import build_docs, validate_links
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,7 +21,8 @@ def build() -> None:
     OUTPUT.mkdir(parents=True)
     for name in (
         "index.html", "index.js", "style.css",
-        "use.html", "use.css", "use.js", "use_worker.js", "web_bridge.py",
+        "use.html", "use.css", "use.js", "tutorial.js", "use_worker.js", "web_bridge.py", "docs.css",
+        "sitemap.xml",
     ):
         if name == "index.html":
             match = re.search(r'^version = "([^"]+)"$', (ROOT / "pyproject.toml").read_text(), re.M)
@@ -42,6 +46,34 @@ def build() -> None:
     with ZipFile(vendor / "dichromatic_map.zip", "w", ZIP_DEFLATED) as archive:
         for source in sorted(PACKAGE.glob("*.py")):
             archive.write(source, f"dichromatic_map/{source.name}")
+    build_docs(ROOT, OUTPUT)
+    validate_site()
+    validate_links(OUTPUT)
+
+
+def validate_site() -> None:
+    expected = {
+        "index.html": "https://yazhuoliu.com/DichromaticMap/",
+        "use.html": "https://yazhuoliu.com/DichromaticMap/use.html",
+    }
+    for filename, canonical in expected.items():
+        html = (OUTPUT / filename).read_text()
+        if html.count(f'<link rel="canonical" href="{canonical}">') != 1:
+            raise ValueError(f"{filename} must declare one canonical URL: {canonical}")
+        if '<meta name="robots" content="index, follow' not in html:
+            raise ValueError(f"{filename} is missing an indexable robots directive")
+        blocks = re.findall(
+            r'<script type="application/ld\+json">\s*(.*?)\s*</script>', html, re.S
+        )
+        if not blocks:
+            raise ValueError(f"{filename} is missing JSON-LD")
+        for block in blocks:
+            json.loads(block)
+
+    sitemap = (OUTPUT / "sitemap.xml").read_text()
+    for canonical in expected.values():
+        if f"<loc>{canonical}</loc>" not in sitemap:
+            raise ValueError(f"sitemap.xml is missing {canonical}")
 
 
 if __name__ == "__main__":
