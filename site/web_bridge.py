@@ -30,7 +30,8 @@ from dichromatic_map.state import (
     CellVertex, PatternParameters, PatternState, SelectedAtom, default_angle_deg,
 )
 from dichromatic_map.strain import (
-    SelectedCellStrain, candidate_vectors, pareto_cells, solve_cells_chunk,
+    CandidatePreparation, SelectedCellStrain, cache_cell_search, candidate_vectors,
+    get_cached_cell_search, pareto_cells, solve_cells_chunk,
     selected_cell_strain_readout, strain_selected_cell, tensor_readout,
 )
 from dichromatic_map.exports import build_export_tables
@@ -83,7 +84,7 @@ def _metadata(request):
     }
 
 
-def _render(request):
+def _render_data(request):
     lattice, axis = request["lattice"], request["axis"]
     angle = float(request["angle"])
     preset = matching_csl_preset(angle, axis=axis)
@@ -107,34 +108,105 @@ def _render(request):
     local = None
     if request.get("local_matching"):
         pairs = local_near_pairs(*grains, float(request.get("local_distance", 0.1)))
-        local = [[*a.tolist(), *b.tolist(), int(layer)]
-                 for a, b, layer in zip(pairs.first, pairs.second, pairs.layers)]
-    return {
+        local = np.column_stack((pairs.first, pairs.second, pairs.layers))
+    coincidences = np.empty((sum(len(points) for points in matches), 3), dtype=float)
+    start = 0
+    for layer, points in enumerate(matches):
+        stop = start + len(points)
+        coincidences[start:stop, :2] = points
+        coincidences[start:stop, 2] = layer
+        start = stop
+    metadata = {
         "angle": angle, "preset": preset.name if preset else None,
-        "grains": [np.column_stack((grain.positions, grain.layers,
-                                    grain.half_indices)).tolist() for grain in grains],
-        "coincidences": [[float(x), float(y), layer]
-                         for layer, points in enumerate(matches) for x, y in points],
-        "local": local,
         "exact_cell": _cell(exact_csl_cell(angle, lattice=lattice, axis=axis))
                       if np.allclose(f, np.eye(2)) and np.allclose(t, 0) else None,
         "layers": geometry.layer_count,
         "reference_axes": [in_plane_reference_axes(sign * angle / 2, f[g]).tolist()
                            for g, sign in enumerate((1, -1))],
     }
+    return metadata, [np.column_stack((grain.positions, grain.layers, grain.half_indices))
+                      for grain in grains], coincidences, local
+
+
+def _render(request):
+    """Preserve the JSON adapter used by exports, smoke checks and clients."""
+    metadata, grains, coincidences, local = _render_data(request)
+    return {
+        **metadata, "grains": [grain.tolist() for grain in grains],
+        "coincidences": [[float(x), float(y), int(layer)] for x, y, layer in coincidences],
+        "local": None if local is None else
+        [[float(x1), float(y1), float(x2), float(y2), int(layer)]
+         for x1, y1, x2, y2, layer in local],
+    }
+
+
+def web_render(serialized):
+    """Provide contiguous buffers for Pyodide without boxing every atom."""
+    metadata, grains, coincidences, local = _render_data(json.loads(serialized))
+    return {
+        "metadata": json.dumps(metadata, allow_nan=False),
+        "grains": [grain.ravel() for grain in grains],
+        "coincidences": coincidences.ravel(),
+        "local": None if local is None else local.ravel(),
+    }
+
+
+def web_near_start(serialized):
+    request = json.loads(serialized)
+    args = (float(request["angle"]), float(request["percent"]),
+            int(request["index"]), request["lattice"], request["axis"])
+    cached = get_cached_cell_search(*args, rows_per_chunk=8)
+    job = {"args": args, "first": None, "second": None, "cells": cached or [],
+           "next": 0, "preparation": None, "complete": cached is not None,
+           "cached": cached is not None}
+    if cached is None:
+        preparation = CandidatePreparation(*args)
+        if preparation.done:
+            job["first"], job["second"] = preparation.step()
+        else:
+            job["preparation"] = preparation
+    return job
+
+
+def web_near_step(job):
+    """Compute the next historical eight-row block, independent of device speed."""
+    if job["complete"]:
+        return True
+    if job["preparation"] is not None:
+        candidates = job["preparation"].step(max_offsets=32)
+        if candidates is not None:
+            job["first"], job["second"] = candidates
+            job["preparation"] = None
+        # Yield between preparation blocks, including the transition into
+        # solving, so obsolete searches can stop before either expensive phase.
+        return False
+    args, start = job["args"], job["next"]
+    stop = start + 8
+    if start < len(job["first"]):
+        _, part = solve_cells_chunk(args[0], args[1], job["first"], job["second"],
+                                    start, stop, args[3], args[4])
+        job["cells"].extend(part)
+    job["next"] = min(stop, len(job["first"]))
+    job["complete"] = stop >= len(job["first"])
+    return job["complete"]
+
+
+def web_near_finish(job):
+    if not job["complete"]:
+        raise ValueError("Cannot publish an incomplete browser search")
+    cells = job["cells"] if job["cached"] else pareto_cells(job["cells"])
+    if not job["cached"]:
+        cache_cell_search(cells, *job["args"], rows_per_chunk=8)
+        job["cells"], job["cached"] = cells, True
+    return json.dumps([{**_cell(cell), "readout": tensor_readout(cell, job["args"][0])}
+                       for cell in cells], allow_nan=False)
 
 
 def _near_search(request):
-    args = (float(request["angle"]), float(request["percent"]),
-            int(request["index"]), request["lattice"], request["axis"])
-    first, second = candidate_vectors(*args)
-    cells = []
-    for start in range(0, len(first), 8):
-        _, part = solve_cells_chunk(args[0], args[1], first, second,
-                                    start, start + 8, args[3], args[4])
-        cells.extend(part)
-    return [{**_cell(cell), "readout": tensor_readout(cell, args[0])}
-            for cell in pareto_cells(cells)]
+    job = web_near_start(json.dumps(request))
+    while not web_near_step(job):
+        pass
+    return json.loads(web_near_finish(job))
 
 
 def _count(request):
