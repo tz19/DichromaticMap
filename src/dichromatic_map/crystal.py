@@ -8,14 +8,18 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from fractions import Fraction
 from itertools import permutations, product
-from math import gcd, lcm
+from math import ceil, floor, gcd, lcm
 import re
 import numpy as np
+from .affine import affine_needs_compensation, affine_points
 
 SUPPORTED_LATTICES = ("FCC", "BCC", "SC")
 
 MAX_LAYERS = 256
 MAX_PROJECTED_COLUMNS = 250_000
+# NumPy's default integer is int32 on WASM. Keep compact ordinary meshes,
+# while scientific reference indices have the same int64 range on both ends.
+_MESH_INDEX_DTYPE = np.dtype(int)
 
 
 class GeometryLimitError(ValueError):
@@ -493,48 +497,142 @@ def projected_columns(
         selected_layers = sorted(set(selected_layers))
     radians = np.deg2rad(rotation_deg)
     cosine, sine = np.cos(radians), np.sin(radians)
-    transform = np.array([[cosine, -sine], [sine, cosine]])
+    rotation = np.array([[cosine, -sine], [sine, cosine]])
+    transform = rotation
+    range_error = (
+        "View exceeds the supported numerical coordinate range. "
+        "Zoom in or reduce --width/--height."
+    )
     if deformation is not None:
         deformation = np.asarray(deformation, dtype=float)
         if deformation.shape != (2, 2) or not np.all(np.isfinite(deformation)):
             raise ValueError("deformation must be a finite 2-by-2 matrix")
-        transform = deformation @ transform
-    screen_basis = transform @ geometry.planar_basis
-    inverse_basis = np.linalg.inv(screen_basis)
-    half_size = np.array([width, height], dtype=float) / 2.0
-    low, high = center - half_size, center + half_size
-    corners = center + np.array([[-1, -1], [-1, 1], [1, -1], [1, 1]]) * half_size
+        with np.errstate(over="ignore", invalid="ignore"):
+            transform = deformation @ transform
+    with np.errstate(over="ignore", invalid="ignore"):
+        screen_basis = transform @ geometry.planar_basis
+    if not np.all(np.isfinite(screen_basis)):
+        raise GeometryLimitError(range_error)
+    with np.errstate(over="ignore", invalid="ignore"):
+        inverse_basis = np.linalg.inv(screen_basis)
+        half_size = np.array([width, height], dtype=float) / 2.0
+        low, high = center - half_size, center + half_size
+        corners = center + np.array([[-1, -1], [-1, 1], [1, -1], [1, 1]]) * half_size
+    if not all(np.all(np.isfinite(array)) for array in
+               (screen_basis, inverse_basis, low, high, corners)):
+        raise GeometryLimitError(range_error)
 
-    all_positions = []
-    all_layers = []
-    all_indices = []
+    # Budget every selected phase before allocating the first dense mesh. A
+    # late limit failure used to discard almost an entire full-size grain.
+    plans = []
     candidate_count = 0
-    # Include points on the viewport edge despite floating-point rotation noise.
-    crop_epsilon = 1.0e-10 * max(1.0, float(np.max(np.abs(corners))))
+    coordinate_bound = 0
+    index_limits = np.iinfo(np.int64)
+    mesh_limits = np.iinfo(_MESH_INDEX_DTYPE)
+    basis_bound = max(sum(abs(int(value)) for value in row)
+                      for row in geometry.basis_half_indices)
+    offset_bound = int(np.max(np.abs(geometry.layer_offsets_half_indices)))
     for layer in selected_layers:
         offset = geometry.layer_offsets_half_indices[layer]
-        screen_offset = transform @ (offset @ geometry.frame[:, :2] / 2.0) + translation
-        integer_corners = (corners - screen_offset) @ inverse_basis.T
-        minima = np.floor(integer_corners.min(axis=0)).astype(int) - 1
-        maxima = np.ceil(integer_corners.max(axis=0)).astype(int) + 1
-        candidate_count += int(np.prod(maxima - minima + 1))
+        with np.errstate(over="ignore", invalid="ignore"):
+            screen_offset = transform @ (offset @ geometry.frame[:, :2] / 2.0) + translation
+            integer_corners = (corners - screen_offset) @ inverse_basis.T
+        if not np.all(np.isfinite(integer_corners)):
+            raise GeometryLimitError(range_error)
+        # Convert finite bounds directly to Python integers: NumPy integer
+        # products and casts can overflow before an allocation guard sees them.
+        minima = tuple(floor(float(value)) - 1 for value in integer_corners.min(axis=0))
+        maxima = tuple(ceil(float(value)) + 1 for value in integer_corners.max(axis=0))
+        nx, ny = (high_bound - low_bound + 1
+                  for low_bound, high_bound in zip(minima, maxima))
+        candidate_count += nx * ny
         if candidate_count > MAX_PROJECTED_COLUMNS:
             raise GeometryLimitError(
                 f"View requires over {MAX_PROJECTED_COLUMNS:,} candidate columns per grain. Zoom in or reduce --width/--height."
             )
+        if any(value < index_limits.min or value > index_limits.max
+               for value in (*minima, *maxima)):
+            raise GeometryLimitError(range_error)
+        mesh_dtype = _MESH_INDEX_DTYPE
+        if mesh_limits.max < index_limits.max and any(
+            value < mesh_limits.min or value > mesh_limits.max
+            for value in (*minima, *maxima)
+        ):
+            mesh_dtype = np.dtype(np.int64)
+        # Reference half-indices must also fit their integer array, even if
+        # the smaller two-dimensional mesh coordinates themselves still fit.
+        mesh_bound = max(map(abs, (*minima, *maxima)))
+        coordinate_bound = max(coordinate_bound, mesh_bound)
+        if mesh_bound * basis_bound + offset_bound > mesh_limits.max:
+            for row, origin in zip(geometry.basis_half_indices, offset):
+                smallest = int(origin) + sum(
+                    int(coefficient) * (low_bound if coefficient >= 0 else high_bound)
+                    for coefficient, low_bound, high_bound in zip(row, minima, maxima)
+                )
+                largest = int(origin) + sum(
+                    int(coefficient) * (high_bound if coefficient >= 0 else low_bound)
+                    for coefficient, low_bound, high_bound in zip(row, minima, maxima)
+                )
+                if smallest < index_limits.min or largest > index_limits.max:
+                    raise GeometryLimitError(range_error)
+                if smallest < mesh_limits.min or largest > mesh_limits.max:
+                    mesh_dtype = np.dtype(np.int64)
+        plans.append((layer, offset, screen_offset, minima, maxima, nx, ny, mesh_dtype))
+
+    if plans:
+        # A finite coordinate can still have a ULP larger than an atom step.
+        # Check that world-coordinate rounding resolves the integer mesh in
+        # both directions, including strongly anisotropic deformations.
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            resolution = np.abs(np.spacing(np.maximum(np.abs(low), np.abs(high))))
+            mesh_resolution = np.abs(inverse_basis) @ resolution
+        if not np.all(np.isfinite(mesh_resolution)) or np.any(mesh_resolution > 1 / 8):
+            raise GeometryLimitError(
+                "View coordinates cannot resolve individual atoms with Float64 precision. "
+                "Reduce the model translation or coordinate magnitude."
+            )
+
+    all_positions = []
+    all_layers = []
+    all_indices = []
+    # Include points on the viewport edge despite floating-point rotation noise.
+    # Clip in local coordinates: translating a two-unit crop to 1e12 must not
+    # turn its numerical edge margin into a hundred-unit rectangle. Each axis
+    # uses its own extent so a thin deformed crop is not enlarged by the other.
+    crop_epsilon = 1.0e-10 * half_size
+    deformation_matrix = np.eye(2) if deformation is None else deformation
+    # An orthonormal cubic-frame row has L1 norm <= sqrt(3). Dividing
+    # half-indices by two bounds a rotated reference component by this
+    # already-known integer-coordinate bound, without another bulk scan.
+    reference_bound = coordinate_bound * basis_bound + offset_bound
+    compensated = affine_needs_compensation(reference_bound, deformation_matrix, translation)
+    if compensated:
+        reference_basis = rotation @ geometry.planar_basis
+    for layer, offset, screen_offset, minima, maxima, nx, ny, mesh_dtype in plans:
         # Fill the final coordinate array directly, preserving meshgrid's
         # row-major order without allocating two intermediate dense meshes.
-        nx, ny = maxima - minima + 1
-        grid = np.empty((ny, nx, 2), dtype=int)
-        grid[:, :, 0] = np.arange(minima[0], maxima[0] + 1)
-        grid[:, :, 1] = np.arange(minima[1], maxima[1] + 1)[:, None]
+        grid = np.empty((ny, nx, 2), dtype=mesh_dtype)
+        grid[:, :, 0] = np.arange(minima[0], maxima[0] + 1, dtype=mesh_dtype)
+        grid[:, :, 1] = np.arange(minima[1], maxima[1] + 1, dtype=mesh_dtype)[:, None]
         coordinates = grid.reshape(-1, 2)
-        positions = coordinates @ screen_basis.T + screen_offset
+        if compensated:
+            # F must act on the same current unstrained reference positions
+            # that a picked atom provides. Precombining F with the lattice
+            # basis rounds coefficients before multiplying huge mesh indices.
+            reference_offset = rotation @ (offset @ geometry.frame[:, :2] / 2)
+            try:
+                reference_positions = affine_points(coordinates, reference_basis, reference_offset)
+                positions = affine_points(reference_positions, deformation_matrix, translation)
+            except ValueError as error:
+                raise GeometryLimitError(range_error) from error
+        else:
+            positions = coordinates @ screen_basis.T + screen_offset
+        relative = positions - center
         keep = (
-            (positions[:, 0] >= low[0] - crop_epsilon)
-            & (positions[:, 0] <= high[0] + crop_epsilon)
-            & (positions[:, 1] >= low[1] - crop_epsilon)
-            & (positions[:, 1] <= high[1] + crop_epsilon)
+            (relative[:, 0] >= -half_size[0] - crop_epsilon[0])
+            & (relative[:, 0] <= half_size[0] + crop_epsilon[0])
+            & (relative[:, 1] >= -half_size[1] - crop_epsilon[1])
+            & (relative[:, 1] <= half_size[1] + crop_epsilon[1])
         )
         coordinates = coordinates[keep]
         all_positions.append(positions[keep])

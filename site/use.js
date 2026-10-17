@@ -20,11 +20,18 @@ const state = {
 };
 let metadata;
 let pattern;
-let worker = new Worker("./use_worker.js", { type: "module" });
+let worker;
+let workerFailure;
+let retryInFlight = false;
 let callNumber = 0;
 const awaiting = new Map();
 let renderGeneration = 0;
 let nearGeneration = 0;
+let analysisGeneration = 0;
+let geometryGeneration = 0;
+const analysisRequests = new Map();
+let vectorReading;
+let vectorPending;
 let renderTimer;
 let nearTimer;
 let drawFrame;
@@ -34,6 +41,11 @@ let visibilityCache;
 let visibleRevision = 0;
 let gpuRenderer;
 let renderCoverage;
+let renderPending;
+let renderError;
+let angleSliderDragging = false;
+let angleDragFinished;
+let anglePreview;
 let pointerStart;
 let dragDistance = 0;
 const activePointers = new Map();
@@ -48,12 +60,15 @@ if (window.matchMedia("(max-width: 820px)").matches) {
 }
 
 function setStatus(message) {
-  const g1 = pattern ? visiblePoints(0).length : 0;
-  const g2 = pattern ? visiblePoints(1).length : 0;
+  const displayed = currentPattern() ? visibleData() : previewVisibleData();
+  const g1 = displayed?.atoms[0].count || 0;
+  const g2 = displayed?.atoms[1].count || 0;
   const cslPoints = pattern ? visibleCSL() : [];
-  const layerCounts = pattern ? visibleData().layerCounts : new Map();
+  const layerCounts = currentPattern() ? visibleData().layerCounts : new Map();
   const byLayer = Array.from(layerCounts, ([layer, count]) => `${layer < 26 ? String.fromCharCode(65 + layer) : `L${layer + 1}`}: ${count}`).join(", ");
-  setHTML($("status"), `<strong>${escapeHtml(message)}</strong>Drag to pan · pinch or wheel to zoom<br>Visible G1 / G2: ${g1} / ${g2}<br>Same-layer CSL: ${cslPoints.length}${byLayer ? ` · ${escapeHtml(byLayer)}` : ""}<br>Compute: on this device`);
+  const edgeHint = !currentPattern() && displayed && !displayed.coverageComplete
+    ? `<br>${angleSliderDragging ? "Release to update edge atoms." : "Updating edge atoms…"}` : "";
+  setHTML($("status"), `<strong>${escapeHtml(message)}</strong>Drag to pan · pinch or wheel to zoom<br>Visible G1 / G2: ${g1} / ${g2}<br>Same-layer CSL: ${currentPattern() ? cslPoints.length : "updating"}${byLayer ? ` · ${escapeHtml(byLayer)}` : ""}${edgeHint}<br>Compute: on this device`);
 }
 function setHTML(element, html) {
   if (element.innerHTML !== html) element.innerHTML = html;
@@ -62,13 +77,18 @@ function escapeHtml(text) {
   return String(text).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]);
 }
 function request(action, data = {}) {
+  if (workerFailure) return Promise.reject(workerFailure);
   return new Promise((resolve, reject) => {
     const id = ++callNumber;
     awaiting.set(id, {resolve, reject});
-    worker.postMessage({id, request: {action, ...data}});
+    postToWorker({id, request: {action, ...data}});
   });
 }
-worker.onmessage = ({data}) => {
+function startWorker() {
+  const owner = new Worker("./use_worker.js", {type:"module"});
+  worker = owner; workerFailure = undefined;
+  owner.onmessage = ({data}) => {
+  if (owner !== worker) return;
   if (data.type === "ready") { setStatus("Ready · choose an interaction tool"); return; }
   const item = awaiting.get(data.id);
   if (!item) return;
@@ -80,33 +100,84 @@ worker.onmessage = ({data}) => {
   }
   else item.resolve(data.result);
 };
-worker.onerror = () => fail(new Error("The local engine could not start. Check your connection and reload."));
+  owner.onerror = () => {
+    if (owner === worker) retireWorker(new Error("The local engine stopped. Check your connection and retry."));
+  };
+  owner.onmessageerror = () => {
+    if (owner === worker) retireWorker(new Error("The local engine returned an unreadable response. Retry the engine."));
+  };
+}
+function postToWorker(message) {
+  if (workerFailure) return false;
+  try { worker.postMessage(message); return true; }
+  catch (error) { retireWorker(error); return false; }
+}
+function retireWorker(error) {
+  releaseAngleDrag();
+  workerFailure = error;
+  worker?.terminate();
+  renderGeneration++; geometryGeneration++; nearGeneration++;
+  invalidateAnalyses();
+  clearTimeout(renderTimer); clearTimeout(nearTimer);
+  renderError = error; renderPending?.finish();
+  const pending = [...awaiting.values()]; awaiting.clear();
+  pending.forEach(item => item.reject(error));
+  fail(error);
+}
+async function retryEngine() {
+  if (retryInFlight) return;
+  retryInFlight = true;
+  try {
+    retireWorker(new Error("Restarting the local engine…"));
+    startWorker();
+    $("retry-engine").hidden = true;
+    $("engine-overlay").querySelector("strong").textContent = "Restarting DichromaticMap";
+    $("engine-overlay").querySelector("span").textContent = "Loading Python + NumPy on your device…";
+    $("engine-overlay").querySelector(".engine-spinner").classList.remove("hidden");
+    renderCoverage = undefined;
+    await loadMetadata(false);
+    if (state.atoms.length === 2) updateVector();
+    if (state.manual.length === 4) countManual();
+  } catch (error) { retireWorker(error); }
+  finally { retryInFlight = false; }
+}
 function fail(error) {
   if (error.name === "AbortError") return;
   const message = error.message || String(error);
   setStatus(message);
-  if (!pattern) {
+  if (!pattern || workerFailure) {
+    $("engine-overlay").classList.remove("hidden");
     $("engine-overlay").querySelector("strong").textContent = "Unable to start the online app";
     $("engine-overlay").querySelector("span").textContent = message;
     $("engine-overlay").querySelector(".engine-spinner").classList.add("hidden");
+    $("retry-engine").hidden = false;
   }
 }
+try { startWorker(); } catch (error) { retireWorker(error); }
 
-function viewSize() {
-  const {width: drawW, height: drawH} = refreshCanvasMetrics().plot;
+function viewSize(metrics = refreshCanvasMetrics()) {
+  const {width: drawW, height: drawH} = metrics.plot;
   state.width = 12 * state.scale;
   state.height = state.width * drawH / drawW;
 }
-function renderDimensions() {
+function renderDimensions(viewWidth = state.width, viewHeight = state.height, rotation = state.displayRotation) {
   // The lattice engine crops in unrotated coordinates. Cover every corner of
   // the displayed rectangle after rotating it back into those coordinates.
-  const radians = state.displayRotation * Math.PI / 180;
+  const radians = rotation * Math.PI / 180;
   const cosine = Math.abs(Math.cos(radians));
   const sine = Math.abs(Math.sin(radians));
-  return {
-    width: Math.max(state.width * 1.43, cosine * state.width + sine * state.height + 2),
-    height: Math.max(state.height * 1.43, sine * state.width + cosine * state.height + 2),
+  const dimensions = {
+    width: Math.max(viewWidth * 1.43, cosine * viewWidth + sine * viewHeight + 2),
+    height: Math.max(viewHeight * 1.43, sine * viewWidth + cosine * viewHeight + 2),
   };
+  // Cover centered angle previews through any rotation when the extra buffer
+  // is small. Keep wide or distant views bounded instead of allocating a huge
+  // origin-centered circle just for a transient preview.
+  const diagonal = Math.hypot(viewWidth, viewHeight) + .5;
+  const width = Math.max(dimensions.width, diagonal), height = Math.max(dimensions.height, diagonal);
+  if (width <= 150 && height <= 150 && width * height <= dimensions.width * dimensions.height * 1.25)
+    return {width, height};
+  return dimensions;
 }
 function rotate(point, degrees) {
   const a = degrees * Math.PI / 180, c = Math.cos(a), s = Math.sin(a);
@@ -164,13 +235,117 @@ function sideVisibleXY(x, y, grain) {
          (state.regions[2 * grain + 1] && cross <= 1e-9);
 }
 function visiblePoints(grain) {
-  return visibleData().points[grain];
+  return currentPattern() ? visibleData().points[grain] : [];
 }
 function visibleCSL() {
-  return visibleData().csl;
+  return currentPattern() ? visibleData().csl : [];
 }
 function visibleLocal() {
-  return visibleData().local;
+  return currentPattern() ? visibleData().local : [];
+}
+function currentRenderParameters() {
+  return {
+    lattice: state.lattice, axis: state.axis, angle: state.angle,
+    deformations: state.deformations, translations: state.translations,
+    local_matching: state.nearEnabled && state.nearMethod === "local",
+    local_distance: Number($("local-distance").value),
+  };
+}
+function currentPattern() {
+  return !angleSliderDragging && !!pattern && renderCoverage?.signature === JSON.stringify(currentRenderParameters());
+}
+async function waitForCurrentRender() {
+  for (;;) {
+    if (angleSliderDragging) { await angleDragFinished.promise; continue; }
+    viewSize();
+    if (currentPattern() && coveredView(renderCoverage)) return;
+    if (!renderPending || renderPending.settled) renderRequest();
+    const pending = renderPending;
+    await pending.promise;
+    if (pending !== renderPending) continue;
+    if (renderError) throw renderError;
+  }
+}
+
+// Angle previews only feed drawing. The committed Float64 rows, identities,
+// matching results and currentPattern guard remain the scientific source.
+function prepareAnglePreview() {
+  if (anglePreview?.source === pattern && anglePreview.parameters.lattice === state.lattice &&
+      anglePreview.parameters.axis === state.axis) return;
+  anglePreview = undefined;
+  if (!pattern || !renderCoverage) return;
+  const parameters = JSON.parse(renderCoverage.signature);
+  if (parameters.lattice !== state.lattice || parameters.axis !== state.axis) return;
+  const inverse = parameters.deformations.map(f => {
+    const det = f[0][0] * f[1][1] - f[0][1] * f[1][0];
+    return [f[1][1] / det, -f[0][1] / det, -f[1][0] / det, f[0][0] / det];
+  });
+  if (!inverse.flat().every(Number.isFinite)) return;
+  const atoms = pattern.grains.map(source => {
+    const rows = window.DichromaticRenderData.DenseRows.from(source, 6);
+    return {rows, indices: new Uint32Array(rows.length), x: new Float64Array(rows.length),
+      y: new Float64Array(rows.length), count: 0, layers: new Set()};
+  });
+  anglePreview = {source: pattern, parameters, inverse, atoms, angle: pattern.angle ?? parameters.angle,
+    coverage: {center: [...renderCoverage.center], width: renderCoverage.width, height: renderCoverage.height},
+    cslMarkers: {count: 0}, localMarkers: {count: 0}};
+}
+function previewVisibleData() {
+  const preview = anglePreview;
+  if (!preview || preview.source !== pattern || preview.parameters.lattice !== state.lattice ||
+      preview.parameters.axis !== state.axis ||
+      preview.signature !== JSON.stringify(currentRenderParameters())) return null;
+  const transform = viewTransform();
+  const selection = `${[...state.visibleLayers[0]]}|${[...state.visibleLayers[1]]}|${state.boundary.flat()}|${state.regions}`;
+  if (preview.drawnSignature === preview.signature && preview.transform === transform &&
+      preview.selection === selection) return preview;
+  preview.drawnSignature = preview.signature; preview.transform = transform; preview.selection = selection;
+  preview.revision = ++visibleRevision;
+  preview.coverageComplete = true;
+  preview.reference_axes = [];
+  const {cosine, sine, cx, cy, ox, oy, width, height, rect: r} = transform;
+  for (let grain = 0; grain < 2; grain++) {
+    const radians = (1 - 2 * grain) * (state.angle - preview.angle) * Math.PI / 360;
+    const c = Math.cos(radians), s = Math.sin(radians), inv = preview.inverse[grain];
+    const f = state.deformations[grain], oldShift = preview.parameters.translations[grain];
+    const shift = state.translations[grain];
+    // p = F R q + t. Undo the committed F/t before applying the new rotation
+    // and current F/t; angle changes also reset a previously fitted structure.
+    const b00 = c * inv[0] - s * inv[2], b01 = c * inv[1] - s * inv[3];
+    const b10 = s * inv[0] + c * inv[2], b11 = s * inv[1] + c * inv[3];
+    const a00 = f[0][0] * b00 + f[0][1] * b10, a01 = f[0][0] * b01 + f[0][1] * b11;
+    const a10 = f[1][0] * b00 + f[1][1] * b10, a11 = f[1][0] * b01 + f[1][1] * b11;
+    const det = a00 * a11 - a01 * a10, coverage = preview.coverage;
+    for (const dx of [-width / 2, width / 2]) for (const dy of [-height / 2, height / 2]) {
+      const mx = cosine * (cx + dx) + sine * (cy + dy) - shift[0];
+      const my = -sine * (cx + dx) + cosine * (cy + dy) - shift[1];
+      const oldX = (a11 * mx - a01 * my) / det + oldShift[0];
+      const oldY = (-a10 * mx + a00 * my) / det + oldShift[1];
+      if (!(Math.abs(oldX - coverage.center[0]) <= coverage.width / 2 &&
+            Math.abs(oldY - coverage.center[1]) <= coverage.height / 2)) preview.coverageComplete = false;
+    }
+    const record = preview.atoms[grain], flat = record.rows.flat;
+    record.count = 0; record.layers.clear();
+    // The original spatial index uses old coordinates. Scan its immutable
+    // rows and clip the transformed points, without rebuilding an index/frame.
+    for (let index = 0; index < record.rows.length; index++) {
+      const offset = index * 6, layer = flat[offset + 2];
+      if (!state.visibleLayers[grain].has(layer)) continue;
+      const ax = flat[offset] - oldShift[0], ay = flat[offset + 1] - oldShift[1];
+      const px = a00 * ax + a01 * ay + shift[0], py = a10 * ax + a11 * ay + shift[1];
+      if (!sideVisibleXY(px, py, grain)) continue;
+      const x = ox + (cosine * px - sine * py - cx) * r.width / width;
+      const y = oy - (sine * px + cosine * py - cy) * r.height / height;
+      if (x >= r.left && x <= r.left + r.width && y >= r.top && y <= r.top + r.height) {
+        const at = record.count++;
+        record.indices[at] = index; record.x[at] = x; record.y[at] = y; record.layers.add(layer);
+      }
+    }
+    const polar = Math.atan2(f[1][0] - f[0][1], f[0][0] + f[1][1]) * 180 / Math.PI;
+    const rotation = polar + (1 - 2 * grain) * state.angle / 2;
+    preview.reference_axes.push([rotate([1, 0], rotation), rotate([0, 1], rotation)]);
+  }
+  return preview;
 }
 function visibleData() {
   const transform = viewTransform();
@@ -181,7 +356,9 @@ function visibleData() {
   const makeSelection = (source, stride, local = false) => {
     const rows = DenseRows.from(source || [], stride);
     const result = {rows, indices: new Uint32Array(rows.length), x: new Float64Array(rows.length),
-      y: new Float64Array(rows.length), count: 0};
+      y: new Float64Array(rows.length), count: 0, layers: new Set(),
+      spatial: window.DichromaticSpatialIndex
+        ? new window.DichromaticSpatialIndex.RowSpatialIndex(rows, {midpoints: local}) : null};
     if (local) { result.x2 = new Float64Array(rows.length); result.y2 = new Float64Array(rows.length); }
     result.points = new SelectedRows(rows, result);
     return result;
@@ -201,8 +378,11 @@ function visibleData() {
   const {cosine, sine, cx, cy, ox, oy, width, height} = transform;
   for (let grain = 0; grain < 2; grain++) {
     const record = data.atoms[grain], flat = record.rows.flat;
-    record.count = 0;
-    for (let index = 0; index < record.rows.length; index++) {
+    record.count = 0; record.layers.clear();
+    const candidates = record.spatial?.queryViewport(transform);
+    const length = candidates?.length ?? record.rows.length;
+    for (let cursor = 0; cursor < length; cursor++) {
+      const index = candidates ? candidates[cursor] : cursor;
       const offset = index * 6, px = flat[offset], py = flat[offset + 1], layer = flat[offset + 2];
       if (!state.visibleLayers[grain].has(layer) || !sideVisibleXY(px, py, grain)) continue;
       const x = ox + (cosine * px - sine * py - cx) * r.width / width;
@@ -210,12 +390,16 @@ function visibleData() {
       if (x >= r.left && x <= r.left + r.width && y >= r.top && y <= r.top + r.height) {
         const at = record.count++;
         record.indices[at] = index; record.x[at] = x; record.y[at] = y;
+        record.layers.add(layer);
       }
     }
   }
   const csl = data.cslMarkers, common = csl.rows.flat;
   csl.count = 0;
-  for (let index = 0; index < csl.rows.length; index++) {
+  const commonCandidates = csl.spatial?.queryViewport(transform);
+  const commonLength = commonCandidates?.length ?? csl.rows.length;
+  for (let cursor = 0; cursor < commonLength; cursor++) {
+    const index = commonCandidates ? commonCandidates[cursor] : cursor;
     const offset = index * 3, px = common[offset], py = common[offset + 1], layer = common[offset + 2];
     if (!state.visibleLayers[0].has(layer) || !state.visibleLayers[1].has(layer) ||
         !sideVisibleXY(px, py, 0) || !sideVisibleXY(px, py, 1)) continue;
@@ -230,7 +414,10 @@ function visibleData() {
   const local = data.localMarkers, pairs = local.rows.flat;
   local.count = 0;
   if (state.nearEnabled && state.nearMethod === "local") {
-    for (let index = 0; index < local.rows.length; index++) {
+    const localCandidates = local.spatial?.queryViewport(transform);
+    const localLength = localCandidates?.length ?? local.rows.length;
+    for (let cursor = 0; cursor < localLength; cursor++) {
+      const index = localCandidates ? localCandidates[cursor] : cursor;
       const offset = index * 5, ax = pairs[offset], ay = pairs[offset + 1],
         bx = pairs[offset + 2], by = pairs[offset + 3], layer = pairs[offset + 4];
       if (!state.visibleLayers[0].has(layer) || !state.visibleLayers[1].has(layer) ||
@@ -253,33 +440,42 @@ function visibleData() {
   return data;
 }
 function renderRequest() {
+  if (angleSliderDragging) { scheduleDraw(); return angleDragFinished.promise; }
   clearTimeout(renderTimer);
-  worker.postMessage({type: "cancel", action: "render"});
+  renderPending?.finish();
+  renderError = undefined;
+  const pending = {settled: false};
+  pending.promise = new Promise(resolve => {
+    pending.finish = () => { pending.settled = true; resolve(); };
+  });
+  renderPending = pending;
+  if (!postToWorker({type: "cancel", action: "render"})) {
+    renderError = workerFailure;
+    pending.finish(); return pending.promise;
+  }
   const generation = ++renderGeneration;
+  scheduleDraw();
   renderTimer = setTimeout(async () => {
     try {
       viewSize();
       const modelCenter = rotate(state.center, -state.displayRotation);
       const dimensions = renderDimensions();
-      const parameters = {
-        lattice: state.lattice, axis: state.axis, angle: state.angle,
-        deformations: state.deformations,
-        translations: state.translations,
-        local_matching: state.nearEnabled && state.nearMethod === "local",
-        local_distance: Number($("local-distance").value),
-      };
+      const parameters = clone(currentRenderParameters());
       const signature = JSON.stringify(parameters);
       if (renderCoverage?.signature === signature && coveredView(renderCoverage)) {
+        if (!angleSliderDragging) anglePreview = undefined;
         draw(); updateSummary(); setStatus("Ready · choose an interaction tool"); return;
       }
       setStatus("Calculating lattice…");
       const raw = await request("render", {
         ...parameters, width: dimensions.width, height: dimensions.height, center: modelCenter,
       });
-      if (generation !== renderGeneration) return;
+      if (angleSliderDragging || generation !== renderGeneration ||
+          signature !== JSON.stringify(currentRenderParameters())) return;
       const result = window.DichromaticRenderData.decodeRenderResult(raw);
-      state.angle = result.angle;
+      if (result.angle !== parameters.angle) throw new Error("The engine returned a different physical angle. Recalculate the view.");
       pattern = result;
+      anglePreview = undefined;
       renderCoverage = {signature: JSON.stringify({...parameters, angle: result.angle}),
         center: modelCenter, ...dimensions};
       $("engine-overlay").classList.add("hidden");
@@ -289,8 +485,11 @@ function renderRequest() {
       draw();
       updateSummary();
       setStatus("Ready · choose an interaction tool");
-    } catch (error) { if (generation === renderGeneration) fail(error); }
+    } catch (error) {
+      if (generation === renderGeneration) { renderError = error; fail(error); }
+    } finally { pending.finish(); }
   }, 45);
+  return pending.promise;
 }
 function coveredView(coverage) {
   for (const x of [-state.width / 2, state.width / 2]) {
@@ -325,7 +524,7 @@ function marker(context, x, y, radius, symbol, stroke, fill, lineWidth = 1.25) {
     }
   } else {
     const sides = {d:4,t:3,s:4,p:5,h:6,star:10,t1:3,t2:3,t3:3}[symbol] || 6;
-    const start = symbol === "d" ? 0 : -Math.PI / 2;
+    const start = {d: 0, s: -Math.PI / 4, t1: Math.PI / 2, t2: 0, t3: Math.PI}[symbol] ?? -Math.PI / 2;
     for (let i = 0; i < sides; i++) {
       const rad = start + i * Math.PI * 2 / sides;
       const rr = symbol === "star" && i % 2 ? radius * .44 : radius;
@@ -455,13 +654,14 @@ function drawBoundary(context) {
   });
 }
 function drawAtoms(context, clean = false) {
+  const visible = currentPattern() ? visibleData() : !clean && context === ctx ? previewVisibleData() : null;
+  if (!visible) return;
   const r = plotRect();
-  const visible = visibleData();
   context.save(); context.beginPath(); context.rect(r.left, r.top, r.width, r.height); context.clip();
   let gpuCanvas = null;
   if (context === ctx && !clean && window.DichromaticGPU &&
       visible.atoms[0].count + visible.atoms[1].count >= 12000) {
-    if (gpuRenderer === undefined) gpuRenderer = window.DichromaticGPU.createRenderer();
+    if (gpuRenderer === undefined) gpuRenderer = window.DichromaticGPU.createRenderer({onRestored: scheduleDraw});
     if (gpuRenderer) {
       const metrics = canvasMetrics || refreshCanvasMetrics();
       gpuCanvas = gpuRenderer.render({width: metrics.width, height: metrics.height,
@@ -501,7 +701,9 @@ function drawAtoms(context, clean = false) {
 }
 function draw() {
   if (drawFrame !== undefined) { cancelAnimationFrame(drawFrame); drawFrame = undefined; }
-  refreshCanvasMetrics();
+  // Held angle previews also paint after a resize, while their numerical
+  // request intentionally waits. Keep equal model-axis scales in every frame.
+  viewSize(refreshCanvasMetrics());
   resizeCanvas();
   const r = plotRect();
   drawGrid(ctx, r);
@@ -512,7 +714,7 @@ function draw() {
   ctx.clip();
   drawAtoms(ctx);
   if (state.showCell) {
-    const cell = state.nearCell || pattern?.exact_cell;
+    const cell = state.nearCell || (currentPattern() ? pattern?.exact_cell : null);
     if (cell) drawPolygon(ctx, cellCorners(cell), "#0d9fa1", [7, 4]);
   }
   if (state.manual.length) {
@@ -554,7 +756,7 @@ function updateReferenceAxesToggle() {
 }
 function positionVectorAnnotation() {
   const annotation = $("vector-annotation");
-  if (state.referenceAxes && pattern?.reference_axes && metadata?.reference_labels) {
+  if (state.referenceAxes && currentPattern() && pattern?.reference_axes && metadata?.reference_labels) {
     const annotationBottom = referenceAxesBounds(plotRect()).top - 10;
     annotation.style.bottom = `${canvas.clientHeight - annotationBottom}px`;
     annotation.style.maxHeight = `${Math.max(1, annotationBottom - 45)}px`;
@@ -567,7 +769,8 @@ function referenceAxesBounds(r) {
   return {left: r.left + 14, top: r.top + r.height - 138, width: 178, height: 123};
 }
 function drawReferenceAxes(context, r) {
-  if (!pattern?.reference_axes || !metadata?.reference_labels) return;
+  const axes = currentPattern() ? pattern?.reference_axes : previewVisibleData()?.reference_axes;
+  if (!axes || !metadata?.reference_labels) return;
   const box = referenceAxesBounds(r);
   const x = box.left + 68, y = box.top + 67;
   context.save();
@@ -576,7 +779,7 @@ function drawReferenceAxes(context, r) {
   context.strokeRect(box.left + .5, box.top + .5, box.width - 1, box.height - 1);
   for (let grain = 0; grain < 2; grain++) {
     for (let axis = 0; axis < 2; axis++) {
-      const direction = rotate(pattern.reference_axes[grain][axis], state.displayRotation);
+      const direction = rotate(axes[grain][axis], state.displayRotation);
       context.strokeStyle = state.colors[grain]; context.fillStyle = state.colors[grain];
       context.lineWidth = 2; context.beginPath(); context.moveTo(x, y);
       const ex = x + direction[0] * 31, ey = y - direction[1] * 31;
@@ -589,24 +792,60 @@ function drawReferenceAxes(context, r) {
   }
   context.restore();
 }
-function drawLegend() {
-  if (!metadata) return;
-  const parts = [];
-  const filled = {o:"●",d:"◆",t:"▲",s:"■",p:"⬟",h:"⬢",star:"★","+":"+",x:"×",t1:"▼",t2:"▶",t3:"◀"};
-  const outline = {o:"○",d:"◇",t:"△",s:"□",p:"⬠",h:"⬡",star:"☆","+":"+",x:"×",t1:"▽",t2:"▷",t3:"◁"};
-  for (let layer = 0; layer < Math.min(metadata.layers, 6); layer++) {
+function plotLegendEntries() {
+  if (!metadata) return [];
+  const entries = [];
+  const layers = [...new Set([...state.visibleLayers[0], ...state.visibleLayers[1]])]
+    .filter(layer => layer >= 0 && layer < metadata.layers).sort((a, b) => a - b);
+  for (const layer of layers.slice(0, 6)) {
     for (let grain = 0; grain < 2; grain++) {
       if (!state.visibleLayers[grain].has(layer)) continue;
       const name = layer < 26 ? String.fromCharCode(65 + layer) : `L${layer + 1}`;
-      const color = state.colors[grain];
-      const symbol = state.symbols[layer];
-      const glyph = grain ? (outline[symbol] || "○") : (filled[symbol] || "●");
-      parts.push(`<span><b class="legend-marker" style="color:${color}">${glyph}</b>G${grain + 1} · ${name}</span>`);
+      entries.push({label: `G${grain + 1} · ${name}`, symbol: state.symbols[layer],
+        stroke: grain ? state.colors[1] : "#2e6799", fill: grain ? null : state.colors[0], lineWidth: 1.25});
     }
   }
-  if (visibleCSL().length) parts.push(`<span><b class="legend-marker" style="color:#e5a50a">◎</b>CSL</span>`);
-  if (visibleLocal().length) parts.push(`<span><b class="legend-marker" style="color:#aa45bb">◎</b>Near pair</span>`);
-  setHTML($("plot-legend"), parts.join(""));
+  if (layers.length > 6) entries.push({label: `+${layers.length - 6} layers`});
+  if (visibleCSL().length) entries.push({label: "CSL", symbol: "o", stroke: "#e5a50a", fill: null, lineWidth: 2.2});
+  if (visibleLocal().length) entries.push({label: "Near pair", symbol: "o", stroke: "#aa45bb", fill: null, lineWidth: 2});
+  return entries;
+}
+function drawLegendMarker(context, entry, x, y) {
+  if (!entry.symbol) return;
+  marker(context, x, y, 6, entry.symbol, entry.stroke, entry.fill, entry.lineWidth);
+}
+function drawLegend() {
+  const entries = plotLegendEntries(), container = $("plot-legend");
+  const dpr = Math.min(globalThis.devicePixelRatio || 1, 2);
+  const signature = JSON.stringify([entries, dpr]);
+  if (container.dataset.legendSignature === signature) return;
+  container.dataset.legendSignature = signature;
+  setHTML(container, entries.map((entry, index) => `<span>${entry.symbol ? `<canvas class="legend-marker" data-legend-index="${index}"` +
+    ` data-symbol="${escapeHtml(entry.symbol)}" aria-hidden="true" style="width:18px;height:18px"></canvas>` : ""}` +
+    `${escapeHtml(entry.label)}</span>`).join(""));
+  for (const icon of document.querySelectorAll("#plot-legend canvas")) {
+    icon.width = icon.height = Math.round(18 * dpr);
+    const context = icon.getContext("2d");
+    context.setTransform(dpr, 0, 0, dpr, 0, 0);
+    drawLegendMarker(context, entries[Number(icon.dataset.legendIndex)], 9, 9);
+  }
+}
+function drawPlotLegend(context, entries = plotLegendEntries()) {
+  if (!entries.length) return;
+  const columns = Math.min(3, entries.length), rows = Math.ceil(entries.length / columns);
+  context.save();
+  context.fillStyle = "#ffffffeb";
+  context.fillRect(48, 48, columns * 96 + 8, rows * 19 + 10);
+  context.strokeStyle = "#cdd8e4";
+  context.strokeRect(48.5, 48.5, columns * 96 + 7, rows * 19 + 9);
+  context.font = "11px Arial"; context.textAlign = "left"; context.textBaseline = "middle";
+  entries.forEach((entry, index) => {
+    const x = 59 + index % columns * 96, y = 63 + Math.floor(index / columns) * 19;
+    drawLegendMarker(context, entry, x, y);
+    context.fillStyle = "#293b59";
+    context.fillText(entry.label, x + (entry.symbol ? 12 : 0), y);
+  });
+  context.restore();
 }
 
 function updateSummary() {
@@ -615,7 +854,7 @@ function updateSummary() {
     $(id).classList.toggle("selected", state.mode === mode);
   }
   const name = `${state.lattice} ⟨${state.axis}⟩`;
-  const preset = pattern?.preset ? ` · ${pattern.preset}` : "";
+  const preset = currentPattern() && pattern?.preset ? ` · ${pattern.preset}` : "";
   $("control-title").textContent = `${name} GB`;
   $("plot-title").textContent = `${name} dichromatic pattern · θ = ${state.angle.toFixed(2)}°${preset}`;
   $("angle-hint").textContent = `Exact θ = ${state.angle.toFixed(8)}° · allowed 0–${metadata.max_angle}°`;
@@ -636,11 +875,11 @@ function updateSummary() {
   $("strain-percent").closest("label").classList.toggle("hidden", state.nearMethod !== "strain");
   $("search-index").closest("label").classList.toggle("hidden", state.nearMethod !== "strain");
   $("near-results").classList.toggle("hidden", !state.nearSolutions.length);
-  if (state.nearEnabled && state.nearMethod === "local" && pattern?.local) {
+  if (state.nearEnabled && state.nearMethod === "local" && currentPattern() && pattern?.local) {
     const visible = visibleData();
     $("near-info").textContent = `Local same-layer mutual nearest pairs\nVisible pairs: ${visible.localMarkers.count}\nMaximum visible separation: ${visible.localMarkers.count ? visible.maxLocalSeparation.toFixed(5) : "—"} a₀\nOriginal atom positions retained.`;
   }
-  $("fit-cell").disabled = !(state.nearCell || pattern?.exact_cell);
+  $("fit-cell").disabled = !(state.nearCell || (currentPattern() ? pattern?.exact_cell : null));
   $("complete-cell").disabled = !(state.manual.length === 2 || state.manual.length === 3);
   $("fit-manual").disabled = !state.manual.length;
   $("apply-strain").disabled = state.manual.length !== 4 ||
@@ -704,6 +943,9 @@ function rebuildLayers() {
 }
 async function loadMetadata(reset = true, supplied = null) {
   const result = supplied || await request("metadata", {lattice: state.lattice, axis: state.axis});
+  applyMetadata(reset, result);
+}
+function applyMetadata(reset, result) {
   metadata = result;
   state.lattice = result.lattice; state.axis = result.axis;
   if (reset) {
@@ -717,6 +959,7 @@ async function loadMetadata(reset = true, supplied = null) {
   rebuildPreset(); rebuildLayers(); updateSummary(); renderRequest();
 }
 function resetSelections() {
+  invalidateAnalyses();
   cancelNearSearch();
   state.boundary = []; state.atoms = []; state.manual = [];
   state.manualLocalCutoff = null; state.manualFit = null; state.manualOriginal = null;
@@ -726,23 +969,59 @@ function resetSelections() {
   $("vector-annotation").hidden = true; $("strain-info").classList.add("hidden");
 }
 async function changeGeometry() {
+  const generation = ++geometryGeneration;
+  invalidateAnalyses(); cancelNearSearch();
   try {
     const lattice = $("structure").value;
     const axis = $("axis").value === "custom" ? $("custom-axis").value : $("axis").value;
     const next = await request("metadata", {lattice, axis});
+    if (generation !== geometryGeneration) return;
     state.lattice = next.lattice; state.axis = next.axis;
     resetSelections();
     await loadMetadata(true, next);
     if (state.nearEnabled && state.nearMethod === "strain") searchNear();
-  } catch (error) { fail(error); }
+  } catch (error) { if (generation === geometryGeneration) fail(error); }
 }
 function changeAngle(value) {
-  const angle = Number(value);
+  let angle = Number(value);
   if (!Number.isFinite(angle) || angle < 0 || angle > metadata.max_angle) return fail(new Error(`Angle must be 0–${metadata.max_angle}°`));
-  state.angle = angle; resetSelections(); rebuildPreset(); updateSummary(); renderRequest();
+  const preset = metadata.presets.find(p => Math.abs(p.angle - angle) <= (metadata.angle_snap_tolerance ?? .006));
+  if (preset) angle = preset.angle;
+  prepareAnglePreview();
+  geometryGeneration++;
+  state.angle = angle; resetSelections();
+  if (anglePreview) anglePreview.signature = JSON.stringify(currentRenderParameters());
+  rebuildPreset(); updateSummary(); scheduleDraw();
+  if (angleSliderDragging) { setStatus("Rotating grains…"); return; }
+  renderRequest();
+  if (state.nearEnabled && state.nearMethod === "strain") searchNear();
+}
+function beginAngleDrag(event) {
+  if (angleSliderDragging || event.button > 0 || event.isPrimary === false) return;
+  prepareAnglePreview();
+  if (anglePreview) anglePreview.signature = JSON.stringify(currentRenderParameters());
+  angleSliderDragging = true;
+  angleDragFinished = {pointerId: event.pointerId};
+  angleDragFinished.promise = new Promise(resolve => { angleDragFinished.resolve = resolve; });
+  clearTimeout(renderTimer); renderGeneration++; renderPending?.finish();
+  postToWorker({type: "cancel", action: "render"});
+  scheduleDraw(); updateSummary();
+}
+function releaseAngleDrag() {
+  if (!angleSliderDragging) return false;
+  angleSliderDragging = false;
+  angleDragFinished.resolve();
+  return true;
+}
+function finishAngleDrag(event) {
+  if (event?.pointerId !== undefined && event.pointerId !== angleDragFinished?.pointerId) return;
+  if (!releaseAngleDrag()) return;
+  renderRequest();
   if (state.nearEnabled && state.nearMethod === "strain") searchNear();
 }
 function setMode(mode) {
+  if (mode === "cell" && state.manualFit) return setStatus("Restore the local structure before editing cell vertices.");
+  invalidateAnalyses();
   state.mode = state.mode === mode ? "idle" : mode;
   if (state.mode === "boundary") state.boundary = [];
   if (state.mode === "vector") { state.atoms = []; $("vector-annotation").hidden = true; }
@@ -754,6 +1033,7 @@ function setMode(mode) {
   setStatus(({idle:"Ready · choose an interaction tool",boundary:"Pick B1, then B2 on visible atoms",vector:"Pick P1, then P2 on visible atoms",cell:"Pick four same-layer CSL or near-pair markers"})[state.mode]);
 }
 function nearestAtom(x, y) {
+  if (!currentPattern()) return null;
   let bestGrain = -1, bestIndex = -1, distance = Infinity;
   const visible = visibleData();
   for (let grain = 0; grain < 2; grain++) {
@@ -769,6 +1049,7 @@ function nearestAtom(x, y) {
     half_indices: [flat[offset + 3], flat[offset + 4], flat[offset + 5]]};
 }
 function nearestCommon(x, y) {
+  if (!currentPattern()) return null;
   let bestSource = null, bestIndex = -1, distance = Infinity;
   const tiedLayers = new Set(), visible = visibleData(), csl = visible.cslMarkers;
   for (let index = 0; index < csl.count; index++) {
@@ -822,31 +1103,78 @@ function resolveCommon(candidate) {
 function manualPolygons() {
   return [0, 1].map(g => state.manual.map(v => v.endpoints[g]));
 }
+function invalidateAnalyses() {
+  analysisGeneration++;
+  if ($("completion-dialog").open) $("completion-dialog").close();
+}
+function analysisInputs(kind) {
+  const geometry = {angle:state.angle, lattice:state.lattice, axis:state.axis};
+  if (kind === "near") return {...geometry,
+    percent:Number($("strain-percent").value), index:Number($("search-index").value)};
+  if (kind === "vector") return {...geometry, atoms:state.atoms,
+    axial_repeat:state.axialRepeat, deformations:state.deformations};
+  if (kind === "count") return {...geometry, polygons:manualPolygons(),
+    deformations:state.deformations, translations:state.translations,
+    layer:state.manual[0]?.layer, boundary:state.boundary,
+    use_boundary:$("count-visible").checked, region_states:state.regions};
+  if (kind === "complete" || kind === "fit") return {...geometry, polygons:manualPolygons(),
+    layer:state.manual[0]?.layer, percent:Number($("manual-strain").value),
+    rotation:Number($("manual-rotation").value)};
+  // Import replaces the whole workspace, so protect newer user edits to it.
+  if (kind === "import") return [sessionState(), sessionSettings(), state.center, state.scale];
+  throw new Error(`Unknown analysis: ${kind}`);
+}
+function analysisSignature(kind) {
+  return JSON.stringify(analysisInputs(kind));
+}
+function beginAnalysis(kind) {
+  const number = (analysisRequests.get(kind) || 0) + 1;
+  analysisRequests.set(kind, number);
+  const inputs = clone(analysisInputs(kind));
+  return {kind, number, generation:analysisGeneration, inputs, signature:JSON.stringify(inputs)};
+}
+function analysisCurrent(token) {
+  return token.generation === analysisGeneration && analysisRequests.get(token.kind) === token.number &&
+    token.signature === analysisSignature(token.kind);
+}
 async function countManual() {
   if (state.manual.length !== 4) return;
-  const selected = JSON.stringify(state.manual);
+  const token = beginAnalysis("count");
   try {
-    const result = await request("count", {
-      polygons: manualPolygons(), angle: state.angle,
-      deformations: state.deformations, translations: state.translations,
-      lattice: state.lattice, axis: state.axis, layer: state.manual[0].layer,
-      boundary: state.boundary, use_boundary: $("count-visible").checked,
-      region_states: state.regions,
-    });
-    if (JSON.stringify(state.manual) !== selected) return;
+    const result = await request("count", token.inputs);
+    if (!analysisCurrent(token)) return;
     const layer = state.manual[0].layer;
-    const text = `G1: ${result.interior[0][layer]} interior + ${result.boundary[0][layer]} boundary\nG2: ${result.interior[1][layer]} interior + ${result.boundary[1][layer]} boundary\nAreas: ${result.areas.map(a => a.toFixed(4)).join(" / ")} a₀²`;
+    const lines = [];
+    for (const grain of [0,1]) {
+      const inside = result.interior[grain][layer], boundary = result.boundary[grain][layer];
+      if (result.half_open_available?.[grain] && result.half_open) {
+        lines.push(`G${grain+1}: ${result.half_open[grain][layer]} half-open unique representatives`);
+        if (result.half_open_edges && result.half_open_corners)
+          lines.push(`  ${inside} interior + ${result.half_open_edges[grain][layer]} edge + ${result.half_open_corners[grain][layer]} corner`);
+        lines.push(`  ${inside+boundary} closed-outline point instances (${boundary} on boundary); opposite-edge copies are duplicates.`);
+      } else {
+        lines.push(`G${grain+1}: ${inside+boundary} atoms in the closed polygon = ${inside} interior + ${boundary} boundary`);
+        lines.push(result.half_open_available?.[grain] === false
+          ? "  Not a parallelogram; periodic unique-cell count is unavailable."
+          : "  Half-open count unavailable.");
+      }
+    }
+    lines.push(`Areas: ${result.areas.map(a => a.toFixed(4)).join(" / ")} a₀²`);
+    lines.push("Only the picked layer is counted; crystal periodicity is not inferred from shape.");
+    const text = lines.join("\n");
     $("manual-info").dataset.count = text;
     updateSummary(); setStatus("Manual cell counted");
   } catch (error) {
-    if (JSON.stringify(state.manual) === selected) {
-      state.manual.pop();
-      state.mode = "cell";
-    }
+    if (!analysisCurrent(token)) return;
+    state.manual.pop();
+    state.mode = "cell";
     draw(); updateSummary(); fail(error);
   }
 }
 async function selectAt(x, y) {
+  if (state.mode === "cell" && state.manual.length >= 4) {
+    state.mode = "idle"; updateSummary(); return;
+  }
   if (state.mode === "boundary") {
     const atom = nearestAtom(x, y); if (!atom) return setStatus("Click a visible atom for the boundary point");
     state.boundary.push(atom.position);
@@ -872,11 +1200,15 @@ async function selectAt(x, y) {
 }
 async function updateVector() {
   if (state.atoms.length !== 2) return;
+  const token = beginAnalysis("vector");
+  const pending = {signature:token.signature, settled:false};
+  pending.promise = new Promise(resolve => {pending.finish = () => {pending.settled=true; resolve();};});
+  vectorPending = pending;
+  vectorReading = undefined;
+  $("vector-annotation").hidden = true;
   try {
-    const result = await request("vector", {
-      atoms: state.atoms, axial_repeat: state.axialRepeat, angle: state.angle,
-      lattice: state.lattice, axis: state.axis, deformations: state.deformations,
-    });
+    const result = await request("vector", token.inputs);
+    if (!analysisCurrent(token)) return;
     const text = [`P1→P2 · axial ${state.axialRepeat >= 0 ? "+" : ""}${state.axialRepeat}`];
     const vectors = Object.entries(result.vectors);
     for (const [grain, v] of vectors) {
@@ -888,11 +1220,27 @@ async function updateVector() {
       }
     }
     text.push(`Current |Δr|/a₀ = ${result.length.toFixed(4)}`);
-    $("vector-readout").textContent = text.join("\n");
+    vectorReading = {signature:token.signature, text:text.join("\n")};
+    $("vector-readout").textContent = vectorReading.text;
     $("vector-annotation").hidden = false;
     positionVectorAnnotation();
     setStatus("Vector measured");
-  } catch (error) { fail(error); }
+  } catch (error) {
+    if (analysisCurrent(token)) {pending.error=error; fail(error);}
+  } finally {pending.finish();}
+}
+
+async function waitForCurrentVector() {
+  while (state.atoms.length === 2) {
+    const signature = analysisSignature("vector");
+    if (vectorReading?.signature === signature) return;
+    if (vectorPending?.signature === signature && vectorPending.error) throw vectorPending.error;
+    if (!vectorPending || vectorPending.signature !== signature || vectorPending.settled) updateVector();
+    const pending = vectorPending;
+    await pending.promise;
+    if (pending !== vectorPending || signature !== analysisSignature("vector")) continue;
+    if (pending.error) throw pending.error;
+  }
 }
 
 function fitPoints(points) {
@@ -910,12 +1258,10 @@ function fitPoints(points) {
 }
 async function completeManual() {
   if (![2, 3].includes(state.manual.length)) return;
+  const token = beginAnalysis("complete");
   try {
-    const candidates = await request("complete", {
-      polygons: manualPolygons(), angle: state.angle, lattice: state.lattice, axis: state.axis,
-      layer: state.manual[0].layer, percent: Number($("manual-strain").value),
-      rotation: Number($("manual-rotation").value),
-    });
+    const candidates = await request("complete", token.inputs);
+    if (!analysisCurrent(token)) return;
     if (!candidates.length) return setStatus("No compatible completion was found");
     const holder = $("completion-options"); holder.replaceChildren();
     candidates.forEach((c, index) => {
@@ -931,6 +1277,7 @@ async function completeManual() {
     });
     const dialog = $("completion-dialog"); dialog.showModal();
     $("completion-accept").onclick = async () => {
+      if (!analysisCurrent(token)) { dialog.close(); return; }
       const selected = holder.querySelector('input[name="completion"]:checked');
       if (!selected) return;
       const c = candidates[Number(selected.value)], oldCount = state.manual.length;
@@ -940,12 +1287,14 @@ async function completeManual() {
         const source = Math.hypot(endpoints[0][0] - endpoints[1][0], endpoints[0][1] - endpoints[1][1]) <= 1e-6 ? "CSL" : c.source;
         state.manual.push({position: midpoint, endpoints, layer: state.manual[0].layer, source});
       }
+      state.mode = "idle";
       dialog.close(); await countManual(); draw(); updateSummary();
     };
-  } catch (error) { fail(error); }
+  } catch (error) { if (analysisCurrent(token)) fail(error); }
 }
 async function toggleSelectedStrain() {
   if (state.manualFit) {
+    invalidateAnalyses();
     state.manual = state.manualOriginal;
     state.manualOriginal = null; state.manualFit = null;
     state.boundary = []; state.atoms = []; $("vector-annotation").hidden = true;
@@ -956,12 +1305,11 @@ async function toggleSelectedStrain() {
     return;
   }
   if (state.manual.length !== 4 || !state.manual.some(v => v.source !== "CSL")) return;
+  const token = beginAnalysis("fit");
   try {
-    const fit = await request("fit_selected", {
-      polygons: manualPolygons(), angle: state.angle, lattice: state.lattice,
-      axis: state.axis, layer: state.manual[0].layer,
-      percent: Number($("manual-strain").value), rotation: Number($("manual-rotation").value),
-    });
+    const fit = await request("fit_selected", token.inputs);
+    if (!analysisCurrent(token)) return;
+    invalidateAnalyses(); cancelNearSearch();
     state.manualOriginal = clone(state.manual);
     state.manualFit = fit; state.nearCell = fit.cell;
     state.boundary = []; state.atoms = []; $("vector-annotation").hidden = true;
@@ -975,11 +1323,12 @@ async function toggleSelectedStrain() {
     $("strain-info").classList.remove("hidden");
     $("strain-info").textContent = fit.readout || `Applied selected-cell strain\nMax principal strain: ${(fit.cell.max_strain * 100).toFixed(6)}%`;
     renderRequest(); await countManual(); updateSummary();
-  } catch (error) { fail(error); }
+  } catch (error) { if (analysisCurrent(token)) fail(error); }
 }
 function applyNearCell(index) {
   const cell = state.nearSolutions[index];
   if (!cell) return;
+  invalidateAnalyses();
   state.boundary = []; state.atoms = []; state.manual = [];
   state.nearCell = cell;
   state.deformations = [cell.f1, cell.f2]; state.translations = [[0, 0], [0, 0]];
@@ -989,11 +1338,12 @@ function applyNearCell(index) {
 function cancelNearSearch() {
   nearGeneration++;
   clearTimeout(nearTimer);
-  worker.postMessage({type: "cancel", action: "near_search"});
+  postToWorker({type: "cancel", action: "near_search"});
 }
 function searchNear() {
   cancelNearSearch();
   if (!state.nearEnabled || state.nearMethod !== "strain") return;
+  invalidateAnalyses();
   const generation = nearGeneration;
   state.nearCell = null; state.nearSolutions = [];
   state.deformations = identity(); state.translations = [[0, 0], [0, 0]];
@@ -1001,21 +1351,21 @@ function searchNear() {
   $("vector-annotation").hidden = true;
   renderRequest(); updateSummary();
   $("near-info").textContent = "Waiting for the current angle…";
+  const token = beginAnalysis("near");
   nearTimer = setTimeout(async () => {
     try {
+      if (generation !== nearGeneration || !analysisCurrent(token)) return;
       setStatus("Searching strained periodic cells locally…");
       $("near-info").textContent = "Searching compatible periodic cells in the browser worker…";
-      const result = await request("near_search", {angle: state.angle,
-        percent: Number($("strain-percent").value), index: Number($("search-index").value),
-        lattice: state.lattice, axis: state.axis});
-      if (generation !== nearGeneration || !state.nearEnabled || state.nearMethod !== "strain") return;
+      const result = await request("near_search", token.inputs);
+      if (generation !== nearGeneration || !analysisCurrent(token) || !state.nearEnabled || state.nearMethod !== "strain") return;
       state.nearSolutions = result;
       $("near-results").replaceChildren();
       result.forEach((cell, i) => $("near-results").add(new Option(cell.label, String(i))));
       if (result.length) applyNearCell(0);
       else $("near-info").textContent = "No compatible cell found within this bounded search. Increase the index or strain limit.";
       updateSummary(); setStatus(result.length ? "Strained common cells ready" : "No strained common cell found");
-    } catch (error) { if (generation === nearGeneration) fail(error); }
+    } catch (error) { if (generation === nearGeneration && analysisCurrent(token)) fail(error); }
   }, 150);
 }
 function downloadBlob(blob, name) {
@@ -1024,7 +1374,15 @@ function downloadBlob(blob, name) {
   document.body.append(anchor); anchor.click(); anchor.remove();
   setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
-function exportPNG() {
+async function exportPNG() {
+  try {
+  for (;;) {
+    await waitForCurrentRender();
+    if (!$("clean-png").checked) await waitForCurrentVector();
+    viewSize();
+    if (currentPattern() && coveredView(renderCoverage) &&
+        ($("clean-png").checked || state.atoms.length !== 2 || vectorReading?.signature === analysisSignature("vector"))) break;
+  }
   // A download can precede the animation frame queued by the latest input.
   draw();
   const clean = $("clean-png").checked;
@@ -1039,17 +1397,7 @@ function exportPNG() {
     context.fillStyle = "#17212b"; context.textAlign = "center"; context.font = "13px Arial";
     context.fillText($("plot-title").textContent, canvas.clientWidth / 2, 17);
     context.textAlign = "left";
-    const legend = Array.from($("plot-legend").children).map(item => item.textContent.trim());
-    if (legend.length) {
-      const columns = Math.min(3, legend.length), rows = Math.ceil(legend.length / columns);
-      context.fillStyle = "#ffffffeb";
-      context.fillRect(48, 48, columns * 96 + 8, rows * 17 + 10);
-      context.strokeStyle = "#cdd8e4";
-      context.strokeRect(48.5, 48.5, columns * 96 + 7, rows * 17 + 9);
-      context.font = "11px Arial"; context.fillStyle = "#4e5f7c";
-      legend.forEach((label, i) => context.fillText(label, 55 + (i % columns) * 96,
-                                                    65 + Math.floor(i / columns) * 17));
-    }
+    drawPlotLegend(context);
     if (!$("vector-annotation").hidden) {
       const lines = $("vector-readout").textContent.split("\n");
       const lowerEdge = state.referenceAxes && pattern?.reference_axes && metadata?.reference_labels
@@ -1061,6 +1409,7 @@ function exportPNG() {
     }
   }
   copy.toBlob(blob => { if (blob) downloadBlob(blob, clean ? "dichromatic-atoms.png" : "dichromatic-pattern.png"); });
+  } catch (error) { fail(error); }
 }
 function sessionState() {
   return {
@@ -1104,13 +1453,19 @@ async function saveSession() {
 }
 async function importSession(file) {
   if (!file) return;
+  invalidateAnalyses(); cancelNearSearch(); geometryGeneration++;
+  const token = beginAnalysis("import");
   try {
     const dataUrl = await new Promise((resolve, reject) => {
       const reader = new FileReader(); reader.onload = () => resolve(reader.result);
       reader.onerror = () => reject(reader.error); reader.readAsDataURL(file);
     });
     const loaded = await request("load_session", {bytes: dataUrl.split(",")[1]});
+    if (!analysisCurrent(token)) return;
     const raw = loaded.state, p = raw.parameters;
+    const nextMetadata = await request("metadata", {lattice:p.lattice, axis:p.axis});
+    if (!analysisCurrent(token)) return;
+    const view = importedView(loaded.view_range, raw.display_rotation_deg);
     state.lattice = p.lattice; state.axis = p.axis; state.angle = p.angle_deg;
     state.a0 = p.lattice_constant; state.mode = raw.interaction_mode;
     state.displayRotation = raw.display_rotation_deg; state.referenceAxes = raw.show_reference_axes;
@@ -1129,10 +1484,17 @@ async function importSession(file) {
     state.nearCell = raw.near_cell; state.nearSolutions = raw.near_cell ? [raw.near_cell] : [];
     state.deformations = raw.deformations; state.translations = raw.translations;
     state.regions = loaded.settings.region_states; state.showCell = loaded.settings.show_common_cell;
-    state.center = [(loaded.view_range[0] + loaded.view_range[1]) / 2,
-                    (loaded.view_range[2] + loaded.view_range[3]) / 2];
-    state.scale = Math.max(.1, Math.min(5, (loaded.view_range[1] - loaded.view_range[0]) / 12));
-    await loadMetadata(false);
+    state.center = view.center; state.scale = view.scale;
+    state.width = view.width; state.height = view.height;
+    $("vector-annotation").hidden = true;
+    $("vector-readout").textContent = "";
+    $("manual-info").dataset.count = "";
+    $("near-results").replaceChildren();
+    if (state.nearCell) $("near-results").add(new Option(state.nearCell.label || "Imported cell", "0"));
+    $("near-info").textContent = state.nearCell ? state.nearCell.readout || "Imported common cell" : "";
+    $("strain-info").classList.toggle("hidden", !state.manualFit);
+    $("strain-info").textContent = state.manualFit ? state.manualFit.readout || "Imported selected-cell strain" : "";
+    applyMetadata(false, nextMetadata);
     $("structure").value = state.lattice;
     const known = ["100","110","111","112"].includes(state.axis);
     $("axis").value = known ? state.axis : "custom";
@@ -1156,8 +1518,33 @@ async function importSession(file) {
     if (state.atoms.length === 2) updateVector();
     if (state.manual.length === 4) countManual();
     setStatus("Session imported");
-  } catch (error) { fail(error); }
-  $("session-file").value = "";
+  } catch (error) { if (analysisCurrent(token)) fail(error); }
+  finally { $("session-file").value = ""; }
+}
+
+function importedView(range, rotation) {
+  const plot = refreshCanvasMetrics().plot;
+  const center = [(range[0]+range[1])/2,(range[2]+range[3])/2];
+  const aspect = plot.width/plot.height;
+  // The rounded midpoint can be asymmetric at large coordinates. Fit its
+  // actual distance to each boundary, rather than only the original span.
+  const required = Math.max(1.2, 2*Math.max(center[0]-range[0],range[1]-center[0]),
+    2*Math.max(center[1]-range[2],range[3]-center[1])*aspect);
+  const measure = width => {
+    const scale = width/12;
+    return {center,scale,width:12*scale,height:12*scale*plot.height/plot.width};
+  };
+  const contains = view => center[0]-view.width/2 <= range[0] && center[0]+view.width/2 >= range[1] &&
+    center[1]-view.height/2 <= range[2] && center[1]+view.height/2 >= range[3];
+  let view = measure(Math.min(60, required*(1+8*Number.EPSILON)));
+  if (!contains(view)) {
+    const slack = 8*Number.EPSILON*Math.max(required,Math.abs(center[0]),Math.abs(center[1])*aspect);
+    view = measure(Math.min(60, view.width+slack));
+  }
+  const dimensions = renderDimensions(view.width, view.height, rotation);
+  if (!contains(view) || dimensions.width > 150 || dimensions.height > 150)
+    throw new Error("The saved view exceeds the browser view range. Open it in the desktop app and save a smaller view.");
+  return view;
 }
 
 $("structure").addEventListener("change", changeGeometry);
@@ -1170,6 +1557,12 @@ $("custom-axis").addEventListener("keydown", e => { if (e.key === "Enter") chang
 $("preset").addEventListener("change", () => { if ($("preset").value) changeAngle($("preset").value); });
 $("angle-number").addEventListener("change", () => changeAngle($("angle-number").value));
 $("angle-slider").addEventListener("input", () => changeAngle($("angle-slider").value));
+$("angle-slider").addEventListener("pointerdown", beginAngleDrag);
+$("angle-slider").addEventListener("change", finishAngleDrag);
+$("angle-slider").addEventListener("lostpointercapture", finishAngleDrag);
+window.addEventListener("pointerup", finishAngleDrag);
+window.addEventListener("pointercancel", finishAngleDrag);
+window.addEventListener("blur", finishAngleDrag);
 function rotationChanged(value) {
   state.displayRotation = Number(value); updateSummary(); scheduleDraw(); renderRequest();
 }
@@ -1193,11 +1586,21 @@ $("no-layers").addEventListener("click", () => {
   state.visibleLayers = [new Set(),new Set()]; rebuildLayers(); draw(); updateSummary(); setStatus("Layers hidden");
 });
 $("show-cell").addEventListener("change", () => { state.showCell = $("show-cell").checked; draw(); });
-$("fit-cell").addEventListener("click", () => { const cell = state.nearCell || pattern?.exact_cell; if (cell) fitPoints(cellCorners(cell)); });
+$("fit-cell").addEventListener("click", () => {
+  const cell = state.nearCell || (currentPattern() ? pattern?.exact_cell : null);
+  if (cell) fitPoints(cellCorners(cell));
+});
 $("pick-gb").addEventListener("click", () => setMode("boundary"));
 $("pick-vector").addEventListener("click", () => setMode("vector"));
 $("pick-cell").addEventListener("click", () => setMode("cell"));
-$("axial-repeat").addEventListener("change", () => { state.axialRepeat = Number($("axial-repeat").value); updateVector(); });
+$("axial-repeat").addEventListener("change", () => {
+  const input = $("axial-repeat"), text = input.value.trim(), value = Number(text);
+  if (!text || !Number.isInteger(value) || value < -4 || value > 4) {
+    input.value = String(state.axialRepeat);
+    setStatus("Axial repeat must be an integer between -4 and 4"); return;
+  }
+  state.axialRepeat = value; updateVector();
+});
 document.querySelectorAll("[data-region]").forEach(input => input.addEventListener("change", () => {
   state.regions[Number(input.dataset.region)] = input.checked;
   draw(); updateSummary(); setStatus("GB side visibility updated"); if (state.manual.length === 4) countManual();
@@ -1295,6 +1698,7 @@ $("completion-cancel").addEventListener("click", () => $("completion-dialog").cl
 $("count-visible").addEventListener("change", countManual);
 $("apply-strain").addEventListener("click", toggleSelectedStrain);
 $("export-png").addEventListener("click", exportPNG);
+$("retry-engine").addEventListener("click", retryEngine);
 $("save-session").addEventListener("click", saveSession);
 $("import-session").addEventListener("click", () => $("session-file").click());
 $("session-file").addEventListener("change", () => importSession($("session-file").files[0]));
@@ -1391,13 +1795,18 @@ canvas.addEventListener("pointerup", event => finishPointer(event));
 canvas.addEventListener("pointercancel", event => finishPointer(event, true));
 canvas.addEventListener("lostpointercapture", event => finishPointer(event, true));
 canvas.addEventListener("wheel", event => {
+  if (!Number.isFinite(event.deltaY) || event.deltaY === 0) return;
   event.preventDefault();
-  state.scale = Math.max(.1, Math.min(5, state.scale * (event.deltaY > 0 ? 1.13 : 1 / 1.13)));
+  const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? plotRect().height : 1;
+  const factor = Math.exp(event.deltaY * unit * .002);
+  state.scale = Math.max(.1, Math.min(5, state.scale * factor));
   $("field-slider").value = state.scale;
   viewSize(); updateSummary(); scheduleDraw(); renderRequest();
 }, {passive:false});
 document.addEventListener("keydown", event => {
-  if (["INPUT","SELECT","TEXTAREA"].includes(document.activeElement?.tagName) || $("completion-dialog").open) return;
+  if (event.ctrlKey || event.metaKey || event.altKey || event.isComposing || event.keyCode === 229 ||
+      event.defaultPrevented || event.target?.isContentEditable || document.activeElement?.isContentEditable ||
+      ["INPUT","SELECT","TEXTAREA"].includes(document.activeElement?.tagName) || $("completion-dialog").open) return;
   const key = event.key.toLowerCase();
   if (key === "r") setMode("boundary");
   else if (key === "v") setMode("vector");

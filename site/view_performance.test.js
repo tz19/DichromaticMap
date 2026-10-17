@@ -5,7 +5,9 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 const renderData = require("./render_data.js");
+const spatialIndex = require("./spatial_index.js");
 
+async function main() {
 const nodes = new Map(), frames = new Map(), timers = new Map(), messages = [];
 let sequence = 0, boundsReads = 0, backingWrites = 0;
 const context = new Proxy({}, {get(target, key) { return target[key] ?? (() => {}); }});
@@ -32,7 +34,7 @@ const sandbox = {
   Worker: class {postMessage(message) {messages.push(message);}},
   Option: class {}, devicePixelRatio: 1,
   window: {matchMedia: () => ({matches: false}), addEventListener() {},
-    DichromaticRenderData: renderData},
+    DichromaticRenderData: renderData, DichromaticSpatialIndex: spatialIndex},
   document: {getElementById: node, querySelectorAll: () => [],
     querySelector: () => node("dummy"), addEventListener() {}, createElement: () => ({getContext: () => context, toBlob() {}})},
   requestAnimationFrame(callback) { const id = ++sequence; frames.set(id, callback); return id; },
@@ -45,11 +47,12 @@ vm.runInContext(fs.readFileSync(path.join(__dirname, "use.js"), "utf8") + `
   metadata = {layers:2, max_angle:90, presets:[], reference_labels:[], layer_spacing:1, axial_period:1};
   globalThis.app = {state, draw, scheduleDraw, exportPNG, visiblePoints, visibleCSL, visibleLocal, visibleData, screen,
     viewSize, coveredView, searchNear, cancelNearSearch, nearestAtom, nearestCommon, resolveCommon, setStatus, updateSummary, drawAtoms, sessionState,
-    setPattern(value) {pattern = value;}};
+    setPattern(value) {pattern = value; renderCoverage = {signature:JSON.stringify(currentRenderParameters()),
+      center: [0,0], width:1e6, height:1e6};}};
 `, sandbox);
 const app = sandbox.app;
 const pattern = {grains:[[], []], coincidences:[], local:[]};
-for (let x = -20; x <= 20; x++) for (let y = -8; y <= 8; y++) for (let layer=0; layer<2; layer++) {
+for (let x = -60; x <= 60; x++) for (let y = -24; y <= 24; y++) for (let layer=0; layer<2; layer++) {
   const point = [x + layer*.2, y + layer*.1, layer, x, y, layer];
   pattern.grains[0].push(point);
   pattern.grains[1].push([...point]);
@@ -63,6 +66,9 @@ const typed = renderData.decodeRenderResult({format:"dichromatic-map-render-v1",
   coincidences:new Float64Array(pattern.coincidences.flat()), local:new Float64Array(pattern.local.flat())});
 app.setPattern(typed); verify();
 const projected = app.visibleData().atoms[0], projectedX = projected.x, projectedIndices = projected.indices;
+const candidates = projected.spatial.queryViewport(app.visibleData().transform);
+assert(candidates && candidates.length < projected.rows.length / 4,
+  "the app queries a conservative spatial subset before its exact Float64 viewport tests");
 app.state.center = [1,-2]; verify();
 assert.equal(app.visibleData().atoms[0],projected,"panning reuses the selection object");
 assert.equal(app.visibleData().atoms[0].x,projectedX,"panning reuses projected Float64 coordinates");
@@ -123,7 +129,7 @@ function referenceSideVisible(point,grain) {
   return app.state.regions[2*grain] && cross>=-1e-9 || app.state.regions[2*grain+1] && cross<=1e-9;
 }
 function verify() {
-  app.viewSize(); app.draw();
+  app.viewSize(); app.setPattern(pattern); app.draw();
   for (let grain=0; grain<2; grain++) {
     assert.deepEqual(Array.from(app.visiblePoints(grain)), pattern.grains[grain].filter(p =>
       app.state.visibleLayers[grain].has(p[2]) && referenceVisible(p,grain)));
@@ -161,7 +167,7 @@ assert.equal(boundsReads,1,"a draw measures the canvas once regardless of point 
 assert.equal(backingWrites,0,"unchanged canvas size must retain its backing store");
 app.scheduleDraw(); app.draw(); assert.equal(frames.size,0,"a synchronous export/selection draw cancels a pending duplicate");
 node("clean-png").checked = false; node("vector-annotation").hidden = true;
-app.scheduleDraw(); app.exportPNG();
+app.scheduleDraw(); await app.exportPNG();
 assert.equal(frames.size,0,"PNG export must flush the latest scheduled view before copying pixels");
 
 const large = new Float64Array(6500*6);
@@ -214,3 +220,6 @@ app.searchNear(); app.cancelNearSearch();
 assert.equal([...timers.values()].filter(t=>t.delay===150).length,0,"disabling search clears delayed work");
 assert(messages.some(m=>m.type==="cancel" && m.action==="near_search"));
 console.log("Viewport filtering, frame coalescing, backing-store reuse, and latest-angle search passed.");
+
+}
+main().catch(error => { console.error(error); process.exitCode = 1; });

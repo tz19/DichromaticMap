@@ -7,8 +7,11 @@ from functools import lru_cache
 import os
 from threading import RLock
 import numpy as np
+from .affine import affine_points
 from .crystal import get_geometry, rotation_matrix_2d
-from .cells import StrainedCell, bases, determinant, reduce_cell, validate_cell_vertices
+from .cells import (
+    StrainedCell, bases, checked_integer_array, determinant, reduce_cell, validate_cell_vertices,
+)
 
 DEFAULT_STRAIN_PERCENT = 2.0
 DEFAULT_SEARCH_INDEX = 12
@@ -33,6 +36,177 @@ class SelectedCellStrain:
     stretches: np.ndarray  # singular values, not eigenvalues of a nonsymmetric F
 
 
+@dataclass(frozen=True)
+class CanonicalCellBasis:
+    """A shared integer change of basis; grain labels and deformations are fixed."""
+
+    m1: np.ndarray
+    m2: np.ndarray
+    cell: np.ndarray
+    transform: np.ndarray
+
+
+def canonical_cell_basis(cell, angle):
+    """Canonical column-Hermite basis of the SAME common translation lattice.
+
+    G1 fixes the convention: m1 = [[a,b],[0,c]], a,c > 0, 0 <= b < a.
+    The same exact integer unimodular transform is applied to m2. Python
+    integers prevent overflow in extended Euclid and column operations.
+    Common vectors are rebuilt from the unchanged G1 F and reference basis,
+    not from a floating sequence of swaps/subtractions. This normalizes basis
+    choice only; it does not fold crystal symmetries, exchange grains, round
+    angles/F, or promise identical floating outputs across NumPy platforms.
+    """
+    if not np.isfinite(angle):
+        raise ValueError("Canonical cell requires a finite reference angle")
+    matrices = []
+    for matrix in (cell.m1, cell.m2):
+        array = np.asarray(matrix)
+        if (array.shape != (2, 2) or array.dtype.kind not in "iufO"
+                or any(isinstance(value, (bool, np.bool_)) for value in array.flat)):
+            raise ValueError("Canonical cell requires integer 2-by-2 edge matrices")
+        values = []
+        for value in array.flat:
+            if isinstance(value, (int, np.integer)):
+                values.append(int(value))
+            elif (isinstance(value, (float, np.floating)) and np.isfinite(value)
+                  and value == np.floor(value)):
+                values.append(int(value))
+            else:
+                raise ValueError("Canonical cell requires finite integer edge matrices")
+        matrices.append(np.array(values, dtype=object).reshape(2, 2))
+    m1, m2 = matrices
+    det1, det2 = determinant(m1), determinant(m2)
+    if det1 * det2 <= 0:
+        raise ValueError("Canonical cell requires compatible nonzero edge determinants")
+    f = np.asarray((cell.f1, cell.f2), dtype=float)
+    common = np.asarray(cell.cell, dtype=float)
+    if (f.shape != (2, 2, 2) or common.shape != (2, 2)
+            or not np.all(np.isfinite(f)) or not np.all(np.isfinite(common))):
+        raise ValueError("Canonical cell requires finite deformations and common vectors")
+    grain_bases = bases(angle, cell.lattice, cell.axis)
+    for deformation, basis, matrix in zip(f, grain_bases, matrices):
+        if not np.allclose(deformation @ basis @ np.asarray(matrix, dtype=float),
+                           common, atol=1e-8, rtol=1e-9):
+            raise ValueError("Canonical cell has inconsistent common translations")
+
+    # Extended Euclid: c*u + d*v = gcd(c,d), with a positive gcd.
+    c, d = m1[1]
+    old_r, r, old_u, u, old_v, v = abs(c), abs(d), 1, 0, 0, 1
+    while r:
+        quotient = old_r // r
+        old_r, r = r, old_r - quotient * r
+        old_u, u = u, old_u - quotient * u
+        old_v, v = v, old_v - quotient * v
+    divisor = old_r
+    second = np.array([old_u * (1 if c >= 0 else -1),
+                       old_v * (1 if d >= 0 else -1)], dtype=object)
+    first = np.array([d // divisor, -c // divisor], dtype=object)
+    if det1 < 0:
+        first = -first
+    width = abs(det1) // divisor
+    second -= ((m1[0] @ second) // width) * first
+    transform = np.column_stack((first, second))
+    canonical_m1, canonical_m2 = m1 @ transform, m2 @ transform
+    canonical_common = (f[0] @ grain_bases[0]) @ np.asarray(canonical_m1, dtype=float)
+    if not np.all(np.isfinite(canonical_common)):
+        raise ValueError("Canonical cell vectors exceed the numerical range")
+    return CanonicalCellBasis(canonical_m1, canonical_m2, canonical_common, transform)
+
+
+def _selected_deformations(solution, pure_strain):
+    f = np.tile(np.eye(2), (2, 1, 1))
+    if pure_strain:
+        for g in (0, 1):
+            f[g, 0, 0] += solution[3 * g]
+            f[g, 1, 1] += solution[3 * g + 1]
+            f[g, 0, 1] = f[g, 1, 0] = solution[3 * g + 2] / np.sqrt(2)
+    else:
+        f += solution.reshape(2, 2, 2)
+    return f
+
+
+def _selected_components(f, pure_strain):
+    increments = f - np.eye(2)
+    if pure_strain:
+        return np.column_stack((increments[:, 0, 0], increments[:, 1, 1],
+                                np.sqrt(2) * increments[:, 0, 1])).ravel()
+    return increments.ravel()
+
+
+def _project_selected_bounds(f, strain_limit, rotation_limit):
+    """Nearest bounded 2D polar deformation, with no grain exchange.
+
+    For fixed R, the closest admissible U is the spectral clipping of
+    sym(R.T F). In 2D its eigenvalue gap is independent of the rotation;
+    its trace is largest at F's proper polar angle. Thus the closest allowed
+    angle is that polar angle clipped to the permitted interval. This also
+    handles singular/reflected intermediate iterates without accepting them.
+    """
+    projected = np.empty_like(f)
+    for grain, matrix in enumerate(f):
+        polar_angle = np.arctan2(matrix[1, 0] - matrix[0, 1], np.trace(matrix))
+        angle = np.clip(polar_angle, -rotation_limit, rotation_limit)
+        cosine, sine = np.cos(angle), np.sin(angle)
+        rotation = np.array(((cosine, -sine), (sine, cosine)))
+        stretch = rotation.T @ matrix
+        stretch = (stretch + stretch.T) / 2
+        values, vectors = np.linalg.eigh(stretch)
+        values = np.clip(values, 1 - strain_limit, 1 + strain_limit)
+        projected[grain] = rotation @ ((vectors * values) @ vectors.T)
+    return projected
+
+
+def _bounded_selected_solution(constraints, rhs, solution, strain_limit,
+                               max_rotation_deg, pure_strain):
+    """Try an equality-preserving bounded fit only after the default exceeds limits.
+
+    Dykstra projections solve the convex pure-strain feasibility problem.
+    Allowing rotations makes the stretch lower bound nonconvex; the same
+    bounded iteration is a feasibility attempt, not an infeasibility proof or
+    elastic optimum. Every returned fit is checked independently below.
+    The pseudoinverse uses the original least-squares rank cutoff.
+    """
+    if np.max(np.abs(constraints @ solution - rhs)) > 1e-8:
+        return None  # Incompatible fourth vertices cannot be fixed by bounds.
+    inverse = np.linalg.pinv(constraints, rcond=1e-11)
+    affine_correction = np.zeros_like(solution)
+    bounds_correction = np.zeros_like(solution)
+    rotation_limit = np.radians(max_rotation_deg)
+    current = solution.copy()
+    unchanged = 0
+    for _ in range(4096):
+        trial = current + bounds_correction
+        bounded = _selected_components(_project_selected_bounds(
+            _selected_deformations(trial, pure_strain), strain_limit, rotation_limit
+        ), pure_strain)
+        bounds_correction = trial - bounded
+        trial = bounded + affine_correction
+        aligned = trial + inverse @ (rhs - constraints @ trial)
+        affine_correction = trial - aligned
+        f = _selected_deformations(aligned, pure_strain)
+        left, stretches, right = np.linalg.svd(f)
+        rotation = left @ right
+        angles = np.degrees(np.arctan2(rotation[:, 1, 0], rotation[:, 0, 0]))
+        if (np.all(np.linalg.det(f) > 0)
+                and np.max(np.abs(stretches - 1)) <= strain_limit + 1e-12
+                and np.max(np.abs(angles)) <= max_rotation_deg + 1e-9
+                and np.max(np.abs(constraints @ aligned - rhs)) <= 1e-9):
+            return aligned
+        # Disjoint sets can leave the primal iterate stationary while dual
+        # corrections grow. Bound both runtime and numerical accumulation.
+        if np.max(np.abs(aligned - current)) <= 128 * np.finfo(float).eps:
+            unchanged += 1
+            if unchanged == 32:
+                return None
+        else:
+            unchanged = 0
+        if not np.all(np.isfinite(aligned)):
+            return None
+        current = aligned
+    return None
+
+
 def strain_selected_cell(
     vertices,
     angle,
@@ -44,7 +218,8 @@ def strain_selected_cell(
 ):
     """Align all four pairs by bounded, homogeneous in-plane deformation.
 
-    Minimize sum_g ||Fg-I||_F^2 under equality of the centered vertex sets.
+    First minimize sum_g ||Fg-I||_F^2 under equality of centered vertex sets.
+    If that solution exceeds the bounds, attempt a bounded feasible fit.
     Small rotations are allowed and bounded separately using Fg = Rg Ug.
     A zero rotation limit selects the symmetric, pure-strain solve instead.
     No candidate search or individual atom snapping is used.
@@ -78,12 +253,14 @@ def strain_selected_cell(
     matrices = []
     for polygon, basis in zip(vertices, grain_bases):
         indices = polygon @ np.linalg.inv(basis).T - phase
-        integer = np.rint(indices).astype(np.int64)
+        integer = checked_integer_array(np.rint(indices))
         if np.max(np.linalg.norm((indices - integer) @ basis.T, axis=1)) > 1e-7:
             raise ValueError(
                 "Vertices must be original atoms in the same selected layer"
             )
-        matrices.append((integer[[1, 3]] - integer[0]).T)
+        matrices.append(checked_integer_array(
+            integer[[1, 3]].astype(object) - integer[0].astype(object)
+        ).T)
     if determinant(matrices[0]) * determinant(matrices[1]) <= 0:
         raise ValueError("The selected cells have incompatible orientation")
 
@@ -101,15 +278,9 @@ def strain_selected_cell(
         else:
             constraints[2 * i] = (x, y, 0, 0, -u, -v, 0, 0)
             constraints[2 * i + 1] = (0, 0, x, y, 0, 0, -u, -v)
-    solution = np.linalg.lstsq(constraints, (b - a).ravel(), rcond=1e-11)[0]
-    f = np.tile(np.eye(2), (2, 1, 1))
-    if pure_strain:
-        for g in (0, 1):
-            f[g, 0, 0] += solution[3 * g]
-            f[g, 1, 1] += solution[3 * g + 1]
-            f[g, 0, 1] = f[g, 1, 0] = solution[3 * g + 2] / root2
-    else:
-        f += solution.reshape(2, 2, 2)
+    rhs = (b - a).ravel()
+    solution = np.linalg.lstsq(constraints, rhs, rcond=1e-11)[0]
+    f = _selected_deformations(solution, pure_strain)
     left, stretches, right = np.linalg.svd(f)
     rotation = left @ right
     rotations_deg = np.degrees(np.arctan2(rotation[:, 1, 0], rotation[:, 0, 0]))
@@ -118,16 +289,53 @@ def strain_selected_cell(
             "All four pairs cannot be aligned without collapse/reflection; choose another cell"
         )
     max_strain = float(np.max(np.abs(stretches - 1)))
+    if (max_strain > percent / 100 + 1e-12
+            or np.max(np.abs(rotations_deg)) > max_rotation_deg + 1e-9):
+        # Any bounded F maps each edge length into [(1-e)L, (1+e)L].
+        # This necessary certificate cheaply rules out many impossible fits
+        # before the iterative fallback, independently of allowed rotations.
+        edge_lengths = np.linalg.norm(
+            vertices[:, :, None, :] - vertices[:, None, :, :], axis=-1
+        )
+        length_difference = np.abs(edge_lengths[0] - edge_lengths[1])
+        feasible_lengths = np.all(length_difference <=
+            (percent / 100 + 1e-12) * edge_lengths.sum(axis=0) + 1e-10)
+        # F2 = F1 T. For two positive stretches bounded by 1 +/- e,
+        # the polar rotation of their product differs from the intervening
+        # rotation by at most asin(e**2): in 2D each stretch's anisotropy
+        # (lambda_max-lambda_min)/(lambda_max+lambda_min) is at most e.
+        # Hence this is a necessary rotation certificate, not a heuristic.
+        original_edges = [basis @ matrix for basis, matrix in zip(grain_bases, matrices)]
+        relative = np.linalg.solve(original_edges[1].T, original_edges[0].T).T
+        relative_angle = abs(np.degrees(np.arctan2(
+            relative[1, 0] - relative[0, 1], np.trace(relative)
+        )))
+        angle_slack = (1e-8 + 256 * np.finfo(float).eps
+                       * np.linalg.cond(original_edges[1]) * 180 / np.pi)
+        feasible_rotation = relative_angle <= (2 * max_rotation_deg
+            + np.degrees(np.arcsin((percent / 100 + 1e-12)**2)) + angle_slack)
+        bounded = (_bounded_selected_solution(
+            constraints, rhs, solution, percent / 100, max_rotation_deg, pure_strain
+        ) if feasible_lengths and feasible_rotation else None)
+        if bounded is not None:
+            f = _selected_deformations(bounded, pure_strain)
+            left, stretches, right = np.linalg.svd(f)
+            rotation = left @ right
+            rotations_deg = np.degrees(np.arctan2(rotation[:, 1, 0], rotation[:, 0, 0]))
+            max_strain = float(np.max(np.abs(stretches - 1)))
     if max_strain > percent / 100 + 1e-12:
         raise ValueError(
-            f"Least-change fit uses {100*max_strain:.6f}% principal strain, above the {percent:.4f}% limit. Nothing was changed."
+            f"No bounded fit found; least-change fit uses {100*max_strain:.6f}% principal strain, above the {percent:.4f}% limit. Nothing was changed."
         )
     if np.max(np.abs(rotations_deg)) > max_rotation_deg + 1e-9:
         raise ValueError(
-            f"Least-change fit uses {np.max(np.abs(rotations_deg)):.6f}° rotation, above the {max_rotation_deg:.4f}° per-grain limit. Nothing was changed."
+            f"No bounded fit found; least-change fit uses {np.max(np.abs(rotations_deg)):.6f}° rotation, above the {max_rotation_deg:.4f}° per-grain limit. Nothing was changed."
         )
-    shifts = centroids.mean(axis=0) - np.einsum("gij,gj->gi", f, centroids)
-    transformed = np.einsum("gij,gnj->gni", f, vertices) + shifts[:, None, :]
+    target_centroid = centroids.mean(axis=0)
+    shifts = np.array([affine_points(centroid, -deformation, target_centroid)
+                       for centroid, deformation in zip(centroids, f)])
+    transformed = np.array([affine_points(polygon, deformation, shift)
+                            for polygon, deformation, shift in zip(vertices, f, shifts)])
     residual = float(np.max(np.linalg.norm(transformed[0] - transformed[1], axis=1)))
     common = f[0] @ grain_bases[0] @ matrices[0]
     periodic_error = np.max(np.abs(common - f[1] @ grain_bases[1] @ matrices[1]))
@@ -231,32 +439,49 @@ class CandidatePreparation:
         self.total_offsets = self.side * self.side
         self._dx = None
         self._use_x = np.empty(0, dtype=int)
-        self._n1, self._n2, self._errors, self._sizes = [], [], [], []
+        self._n1 = np.empty((0, 2), dtype=int)
+        self._n2 = np.empty((0, 2), dtype=int)
+        self._errors = self._sizes = np.empty(0)
+        self._size_cutoff = self._error_cutoff = np.inf
 
     @property
     def done(self):
         return self._result is not None
 
+    def _retain(self, first, second, error, size):
+        """Keep the exact stable top-k of each metric for the visited prefix.
+
+        A row outside both prefix top-k lists cannot re-enter either list as
+        later rows arrive. Equal later metrics cannot displace earlier rows.
+        Retained rows remain in enumeration order, so stable sorting a merge
+        gives exactly the historical whole-enumeration selection, including
+        ties, without storing all accepted translations.
+        """
+        useful = (size < self._size_cutoff) | (error < self._error_cutoff)
+        if not np.any(useful):
+            return
+        first = np.concatenate((self._n1, first[useful]))
+        second = np.concatenate((self._n2, second[useful]))
+        error = np.concatenate((self._errors, error[useful]))
+        size = np.concatenate((self._sizes, size[useful]))
+        count = MAX_VECTORS // 2
+        by_size = np.argsort(size, kind="stable")[:count]
+        by_error = np.argsort(error, kind="stable")[:count]
+        chosen = np.unique(np.r_[by_size, by_error])
+        self._n1, self._n2 = first[chosen], second[chosen]
+        self._errors, self._sizes = error[chosen], size[chosen]
+        if len(by_size) == count:
+            self._size_cutoff = size[by_size[-1]]
+            self._error_cutoff = error[by_error[-1]]
+
     def _finish(self):
-        if not self._n1:
-            first = np.empty((0, 2), dtype=int)
-            second = np.empty((0, 2), dtype=int)
-        else:
-            first, second = np.concatenate(self._n1), np.concatenate(self._n2)
-            error, size = np.concatenate(self._errors), np.concatenate(self._sizes)
-            chosen = np.unique(np.r_[
-                np.argsort(size, kind="stable")[:MAX_VECTORS // 2],
-                np.argsort(error, kind="stable")[:MAX_VECTORS // 2],
-            ])
-            first, second = first[chosen], second[chosen]
+        first, second = self._n1, self._n2
         first.setflags(write=False)
         second.setflags(write=False)
         self._result = first, second
         _cache_put(_candidate_cache, self.parameters, self._result, _CANDIDATE_CACHE_LIMIT)
-        self._n1.clear()
-        self._n2.clear()
-        self._errors.clear()
-        self._sizes.clear()
+        # Only the two small completed arrays are retained by the preparation.
+        self._errors = self._sizes = np.empty(0)
 
     def step(self, max_offsets=32):
         """Return candidate array copies on completion, otherwise None."""
@@ -281,6 +506,11 @@ class CandidatePreparation:
                        <= self.coordinate_bounds[:, 0])
                 )
             if not len(self._use_x):
+                # This entire dx row is empty. Count the skipped logical
+                # offsets against the step budget so cancellation remains
+                # bounded exactly as before.
+                next_row = (self.completed_offsets + self.side - 1) // self.side
+                self.completed_offsets = min(stop, next_row * self.side)
                 continue
             rows = self._use_x
             use = rows[np.flatnonzero(
@@ -299,10 +529,7 @@ class CandidatePreparation:
             mask = (error <= self.e + 1e-12) & (l2 > 0)
             if not np.any(mask):
                 continue
-            self._n1.append(self.integers[use[mask]])
-            self._n2.append(other[mask])
-            self._errors.append(error[mask])
-            self._sizes.append(size[mask])
+            self._retain(self.integers[use[mask]], other[mask], error[mask], size[mask])
         if self.completed_offsets == self.total_offsets:
             self._finish()
             return tuple(array.copy() for array in self._result)
@@ -321,7 +548,12 @@ def pareto_cells(cells, limit=12):
     unique = {}
     for cell in cells:
         key = (cell.atoms, tuple(np.round(np.r_[cell.f1.ravel(), cell.f2.ravel()], 9)))
-        unique.setdefault(key, cell)
+        existing = unique.get(key)
+        # Deduplication uses the same meaningful-improvement tolerance as the
+        # frontier. Keep the historical first representative for true ties,
+        # but do not discard a later materially lower strain in a round9 bin.
+        if existing is None or cell.max_strain < existing.max_strain - 1e-10:
+            unique[key] = cell
     ordered = sorted(unique.values(), key=lambda c: (sum(c.atoms), c.max_strain))
     result, best = [], np.inf
     for cell in ordered:
@@ -379,8 +611,9 @@ def cache_cell_search(
             raise TypeError("Search cache requires StrainedCell results")
         for field in ("m1", "m2", "f1", "f2", "cell"):
             array = np.asarray(getattr(cell, field))
-            if array.shape != (2, 2) or array.dtype.kind not in "biuf":
-                raise ValueError("Search cache requires real numeric 2-by-2 cell arrays")
+            if (array.shape != (2, 2) or array.dtype.kind not in "biuf"
+                    or not np.all(np.isfinite(array))):
+                raise ValueError("Search cache requires finite real numeric 2-by-2 cell arrays")
         if not np.isfinite(cell.max_strain):
             raise ValueError("Search cache requires a finite strain")
         geometry = get_geometry(cell.lattice, cell.axis)
@@ -498,9 +731,26 @@ def solve_cells_chunk(
     second = np.concatenate([np.arange(row + 1, n) for row in rows])
     m1 = np.stack([integers1[first], integers1[second]], axis=2)
     m2 = np.stack([integers2[first], integers2[second]], axis=2)
-    d1 = m1[:, 0, 0] * m1[:, 1, 1] - m1[:, 0, 1] * m1[:, 1, 0]
-    d2 = m2[:, 0, 0] * m2[:, 1, 1] - m2[:, 0, 1] * m2[:, 1, 0]
-    mask = (np.abs(d1) >= 0.5) & (d1 * d2 > 0)
+    determinants = []
+    for matrix in (m1, m2):
+        # The normal index<=40 path remains vectorized. Public core callers
+        # can supply larger integer vectors; widen platform ints, then use
+        # Python arithmetic when either determinant product could overflow.
+        if matrix.dtype.kind not in "iu" or (
+            matrix.dtype.kind == "u" and np.max(matrix) > np.iinfo(np.int64).max
+        ):
+            matrix = checked_integer_array(matrix)
+        else:
+            matrix = matrix.astype(np.int64, copy=False)
+        exact = matrix
+        if np.min(matrix) < -(2**31 - 1) or np.max(matrix) > 2**31 - 1:
+            exact = matrix.astype(object)
+        determinants.append(exact[:, 0, 0] * exact[:, 1, 1]
+                            - exact[:, 0, 1] * exact[:, 1, 0])
+    d1, d2 = determinants
+    # Compare signs directly: d1*d2 can overflow even when both determinants
+    # individually fit their integer dtype.
+    mask = (d1 != 0) & (((d1 > 0) & (d2 > 0)) | ((d1 < 0) & (d2 < 0)))
     m1, m2 = m1[mask], m2[mask]
     if not len(m1):
         return os.getpid(), []

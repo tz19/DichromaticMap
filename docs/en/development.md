@@ -382,6 +382,18 @@ Normally all four entries of each gradient are free, giving eight equations in e
 A rotation limit of exactly zero switches to symmetric gradients and six Frobenius-scaled
 unknowns. Both variants use `numpy.linalg.lstsq` with `rcond=1e-11`.
 
+The original least-change solution is kept unchanged whenever it satisfies both
+limits. Otherwise, up to 4096 Dykstra projection iterations alternate the exact
+affine vertex equalities and bounded polar deformations, using the same `1e-11`
+rank cutoff. The zero-rotation problem is convex: the symmetric gradients have
+eigenvalues in `[1-p/100, 1+p/100]`. With rotation allowed the lower singular-value
+bound is nonconvex, so this is a bounded feasibility attempt, not a proof of
+infeasibility or a global constrained optimum. A stationary failed iteration
+terminates early. Every proposed fallback independently passes all original
+stretch, rotation, vertex and common-edge checks before it can be applied.
+For example, SC [100] squares of side 49 and 51 admit stretches 1.02 and 0.98
+at a 2% limit, despite the unconstrained least-change fit needing 2.039184%.
+
 The common target centroid is `c=(c1+c2)/2`, so each grain receives the uniform translation
 `tg = c - Fg cg`. These translations are essential when the selected cell is away from the
 origin or belongs to a shifted axial phase.
@@ -674,3 +686,12 @@ and frames; a₀/Å and a₀²/Å² conversions use the saved lattice constant. 
 manual-cell or vector selections produce header-only tables, whereas an
 unstrained grain has a real identity F and zero E. Numerical export errors fail
 the save instead of silently writing partial or stale results.
+
+`canonical_cell_basis(cell, angle)` uses exact integer extended Euclid to produce
+the G1 column-Hermite form `[[a,b],[0,c]]`, `a,c>0`, `0<=b<a`. The same unimodular
+column transform is applied to G2; common physical vectors are reconstructed
+from the unchanged G1 F, reference basis and canonical indices. `strain.csv`
+includes these indices/vectors for a current applied cell or an undeformed exact
+CSL cell. Search representatives, UI cells, grain assignments and F are unchanged.
+This canonicalizes bases of one cell, not crystal symmetry/grain-exchange classes;
+cross-platform floating bit identity is deliberately not obtained by rounding.
